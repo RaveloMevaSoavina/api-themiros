@@ -17,8 +17,8 @@ echo "Validating Docker Compose configuration..."
 echo "Building the API image..."
 "${compose[@]}" build --pull api
 
-echo "Starting the API and HTTPS proxy..."
-"${compose[@]}" up -d --remove-orphans
+echo "Starting the API..."
+"${compose[@]}" up -d --remove-orphans api
 
 echo "Waiting for the API health check..."
 for attempt in {1..30}; do

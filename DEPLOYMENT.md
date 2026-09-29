@@ -1,89 +1,103 @@
 # Déploiement Docker de l'API Themiros
 
-La pile contient l'API FastAPI et Caddy. Caddy publie automatiquement l'API en
-HTTPS et renouvelle son certificat. Le port applicatif 8000 reste uniquement
-accessible depuis le serveur.
+L'API fonctionne dans Docker sur `127.0.0.1:8010`. Le Caddy déjà installé sur
+le serveur publie `api.evoranq.com` en HTTPS. Le port 8010 n'est jamais exposé
+sur Internet et le port 8000 reste réservé à Supabase Envoy.
 
-## Prérequis serveur
+## Architecture du serveur
 
-- Docker Engine avec le plugin Docker Compose ;
-- les ports entrants TCP 80 et 443, ainsi que UDP 443, ouverts ;
-- un enregistrement DNS `A` ou `AAAA` pour le sous-domaine de l'API pointant
-  vers le serveur ;
-- aucun autre service ne doit utiliser les ports 80 ou 443.
+- `supabase.evoranq.com` : Supabase Envoy sur le port 8000 ;
+- `api.evoranq.com` : Caddy vers `127.0.0.1:8010` ;
+- `app.themiros.com` : dashboard hébergé sur Vercel.
+
+Le DNS de `api.evoranq.com` doit pointer vers l'adresse IP du serveur.
 
 ## Premier déploiement
 
-Copier ou cloner le dossier `api-themiros` sur le serveur, puis :
+Cloner le dépôt sur le serveur :
 
 ```bash
+git clone https://github.com/RaveloMevaSoavina/api-themiros.git
 cd api-themiros
 cp .env.production.example .env.production
 chmod 600 .env.production
+nano .env.production
 ```
 
-Renseigner toutes les valeurs de `.env.production`. `API_DOMAIN` doit contenir
-uniquement le nom DNS, par exemple `api.example.com`. Dans
-`CORS_ALLOWED_ORIGINS`, indiquer l'origine exacte du dashboard, avec `https://`
-mais sans chemin.
+Renseigner dans `.env.production` les nouvelles clés OpenAI et Supabase. Ne
+jamais placer de secret dans `.env.production.example`. Vérifier notamment :
 
-Déployer ensuite :
+```env
+API_DOMAIN=api.evoranq.com
+API_HOST_PORT=8010
+APP_ENV=production
+APP_DEBUG=false
+CORS_ALLOWED_ORIGINS=https://app.themiros.com
+```
+
+Construire et démarrer l'API :
 
 ```bash
 ./deploy/deploy.sh
+curl http://127.0.0.1:8010/health
+curl http://127.0.0.1:8010/ready
 ```
 
-Vérifier les deux sondes :
+## Raccorder le Caddy existant
+
+Ne pas remplacer le fichier Caddy existant : il contient déjà la configuration
+de Supabase et probablement celle de n8n. Ajouter le contenu de
+`deploy/Caddyfile.api` à `/etc/caddy/Caddyfile` :
 
 ```bash
-curl https://api.example.com/health
-curl https://api.example.com/ready
+sudo nano /etc/caddy/Caddyfile
 ```
 
-`/health` vérifie le processus API. `/ready` vérifie également la connexion à
-Supabase et doit répondre avec le statut `ready`.
+Valider la configuration avant tout rechargement :
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+sudo systemctl status caddy --no-pager
+```
+
+Effectuer ensuite les tests publics :
+
+```bash
+curl https://api.evoranq.com/health
+curl https://api.evoranq.com/ready
+```
+
+`/health` vérifie le processus API. `/ready` vérifie aussi l'accès à Supabase et
+doit répondre avec le statut `ready`.
 
 ## Configuration du dashboard
 
-Le dashboard doit être construit avec l'URL publique de l'API :
+Configurer l'environnement de production du dashboard/Vercel, puis lancer un
+nouveau déploiement du frontend :
 
 ```env
-VITE_API_URL=https://api.example.com
+VITE_API_URL=https://api.evoranq.com
 ```
 
-Les variables Vite sont injectées à la compilation : reconstruire et redéployer
-le dashboard après cette modification.
-
-## Mise à jour
-
-Après avoir récupéré la nouvelle version du code :
+## Mise à jour de l'API
 
 ```bash
-git pull
+cd api-themiros
+git pull --ff-only
 ./deploy/deploy.sh
+curl https://api.evoranq.com/health
 ```
 
-Pour suivre les journaux :
-
-```bash
-docker compose --env-file .env.production logs -f --tail=100
-```
-
-Pour connaître l'état des services :
+Consulter l'état et les journaux :
 
 ```bash
 docker compose --env-file .env.production ps
+docker compose --env-file .env.production logs -f --tail=100 api
 ```
 
-## Arrêt et sauvegarde
-
-Arrêter les conteneurs sans supprimer les certificats :
+Arrêter l'API :
 
 ```bash
 docker compose --env-file .env.production down
 ```
-
-Ne pas ajouter l'option `--volumes` : le volume `caddy_data` contient les
-certificats TLS. Sauvegarder `.env.production` dans un gestionnaire de secrets,
-et non dans Git.
-

@@ -1,8 +1,4 @@
-{
-	admin off
-}
-
-{$API_DOMAIN} {
+api.evoranq.com {
 	encode zstd gzip
 
 	header {
@@ -12,11 +8,10 @@
 		Referrer-Policy no-referrer
 	}
 
-	reverse_proxy api:8000
+	reverse_proxy 127.0.0.1:8010
 
 	log {
 		output stdout
 		format console
 	}
 }
-

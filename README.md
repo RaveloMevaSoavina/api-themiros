@@ -33,9 +33,10 @@ validation to references, applicable criteria, pillar count and weights.
 
 ## Production deployment
 
-The production stack runs the API and an automatic HTTPS reverse proxy with
-Docker Compose. See [DEPLOYMENT.md](DEPLOYMENT.md) for server prerequisites,
-first deployment, updates and operational commands.
+The production stack runs the API with Docker Compose on a host-only port. The
+server's existing Caddy instance provides HTTPS. See
+[DEPLOYMENT.md](DEPLOYMENT.md) for the first deployment, Caddy configuration,
+updates and operational commands.
 
 ## Structure
 
