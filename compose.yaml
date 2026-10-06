@@ -43,6 +43,9 @@ services:
     env_file:
       - .env.production
     command: ["python", "-m", "app.modules.ingestion.worker"]
+    # Pas de serveur HTTP : le healthcheck de l'image ne s'applique pas.
+    healthcheck:
+      disable: true
     security_opt:
       - no-new-privileges:true
     cap_drop:

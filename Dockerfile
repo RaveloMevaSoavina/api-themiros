@@ -25,7 +25,7 @@ RUN pip install ".[nlp]" \
     && python -c "from app.core.config import Settings; from app.modules.ingestion.analysis.embeddings import load_local_model; s = Settings(); load_local_model(s.ingestion_embedding_model, '/opt/fastembed', None)" \
     && groupadd --system app \
     && useradd --system --gid app --home-dir /app --no-create-home app \
-    && chown -R app:app /app
+    && chown -R app:app /app /opt/fastembed
 
 USER app
 
