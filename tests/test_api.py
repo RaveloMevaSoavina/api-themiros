@@ -131,3 +131,33 @@ def test_unconfigured_generator_has_explicit_error() -> None:
 
     assert response.status_code == 503
     assert response.json()["code"] == "AI_PROVIDER_UNAVAILABLE"
+
+
+def test_ingestion_endpoints_require_authentication() -> None:
+    document = {
+        "workspace_id": "11111111-1111-4111-8111-111111111111",
+        "document_id": "22222222-2222-4222-8222-222222222222",
+    }
+    with TestClient(app) as client:
+        responses = [
+            client.post(
+                "/api/v1/ingestion/full",
+                json={
+                    **document,
+                    "storage_path": "workspace/document/file.pdf",
+                    "mime_type": "application/pdf",
+                },
+            ),
+            client.post("/api/v1/ingestion/qualify", json=document),
+            client.post(
+                "/api/v1/ingestion/segment",
+                json={"document_id": document["document_id"]},
+            ),
+            client.get(
+                "/api/v1/jobs/33333333-3333-4333-8333-333333333333",
+            ),
+        ]
+
+    for response in responses:
+        assert response.status_code == 401
+        assert response.json()["code"] == "AUTHENTICATION_REQUIRED"

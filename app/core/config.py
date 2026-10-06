@@ -32,6 +32,35 @@ class Settings(BaseSettings):
     openai_output_cost_eur_per_million: Decimal = Field(default=Decimal("0"), ge=0)
     ai_max_cost_eur: Decimal = Field(default=Decimal("0"), ge=0)
 
+    # E4 — ingestion documentaire. Les seuils métier (70/40, bonus, malus)
+    # vivent dans la table `ingestion_settings` ; ici, l'infrastructure.
+    ingestion_storage_bucket: str = "documents"
+    ingestion_worker_poll_seconds: float = Field(default=2, gt=0, le=60)
+    ingestion_worker_lease_seconds: int = Field(default=300, ge=60, le=3600)
+    ingestion_worker_concurrency: int = Field(default=2, ge=1, le=16)
+    # Embeddings calculés localement (fastembed, ONNX) par défaut ; `openai`
+    # reste possible avec un modèle `text-embedding-3-*` réduit à 768.
+    # Changer de modèle impose de réindexer tout le corpus.
+    ingestion_embedding_provider: Literal["local", "openai"] = "local"
+    # Version int8 du modèle : ~3 fois plus rapide sur CPU, vecteurs quasi
+    # identiques (similarité ≥ 0,99 avec la version complète).
+    ingestion_embedding_model: str = (
+        "sentence-transformers/paraphrase-multilingual-mpnet-base-v2-int8"
+    )
+    ingestion_embedding_dimensions: int = Field(default=768, gt=0)
+    ingestion_embedding_batch_size: int = Field(default=32, ge=1, le=2048)
+    ingestion_embedding_cache_dir: str | None = None
+    ingestion_embedding_threads: int | None = Field(default=None, ge=1, le=64)
+    ingestion_embedding_window_words: int = Field(default=80, ge=16, le=512)
+    # Segments vectorisés pour le score de pertinence (§7.3), répartis dans
+    # tout le document ; les autres ne le sont qu'à l'indexation.
+    ingestion_relevance_sample_segments: int = Field(default=32, ge=1, le=1000)
+    ingestion_ocr_base_languages: str = "fra+eng"
+    ingestion_ocr_dpi: int = Field(default=300, ge=100, le=600)
+    ingestion_ocr_page_timeout_seconds: int = Field(default=120, gt=0, le=600)
+    ingestion_ocr_parallelism: int = Field(default=4, ge=1, le=16)
+    ingestion_ner_model: str = "xx_ent_wiki_sm"
+
     @property
     def cors_origins(self) -> list[str]:
         return [

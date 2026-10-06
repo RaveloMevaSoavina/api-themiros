@@ -31,5 +31,24 @@ services:
     networks:
       - backend
 
+  # Traitement asynchrone de l'ingestion documentaire (spec §12.3). Plusieurs
+  # réplicas peuvent tourner : la file PostgreSQL distribue les tâches.
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: themiros-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.production
+    command: ["python", "-m", "app.modules.ingestion.worker"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+
 networks:
   backend:
