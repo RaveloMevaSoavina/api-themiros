@@ -15,8 +15,10 @@ import httpx
 from app.core.config import Settings, get_settings
 from app.core.errors import ApiError
 from app.infrastructure.supabase import SupabaseGateway
+from app.modules.classification.repository import ClassificationRepository
+from app.modules.classification.worker import ClassificationWorker
 from app.modules.ingestion.analysis.country import get_country_detector
-from app.modules.ingestion.analysis.embeddings import build_embedder
+from app.modules.ingestion.analysis.embeddings import Embedder, build_embedder
 from app.modules.ingestion.errors import is_abandon, is_retryable
 from app.modules.ingestion.pipeline import IngestionPipeline, lease_lost
 from app.modules.ingestion.repository import ClaimedJob, IngestionRepository
@@ -44,6 +46,10 @@ class IngestionWorker:
         self._settings = settings
         self._worker_id = worker_id or f"{socket.gethostname()}-{uuid4().hex[:8]}"
         self._stopping = asyncio.Event()
+
+    @property
+    def worker_id(self) -> str:
+        return self._worker_id
 
     def stop(self) -> None:
         self._stopping.set()
@@ -132,12 +138,12 @@ class IngestionWorker:
 
 
 def build_pipeline(
-    settings: Settings, client: httpx.AsyncClient
+    settings: Settings, client: httpx.AsyncClient, embedder: Embedder | None = None
 ) -> tuple[IngestionRepository, IngestionPipeline]:
     repository = IngestionRepository(SupabaseGateway(settings, client), settings)
     pipeline = IngestionPipeline(
         repository,
-        build_embedder(settings),
+        embedder or build_embedder(settings),
         get_country_detector(settings.ingestion_ner_model),
         settings,
     )
@@ -147,12 +153,27 @@ def build_pipeline(
 async def _main() -> None:
     settings = get_settings()
     async with httpx.AsyncClient() as client:
-        repository, pipeline = build_pipeline(settings, client)
+        # Un seul modèle chargé : segments et sondes des cadres partagent
+        # le même espace vectoriel.
+        embedder = build_embedder(settings)
+        repository, pipeline = build_pipeline(settings, client, embedder)
         worker = IngestionWorker(repository, pipeline, settings)
+        classifier = ClassificationWorker(
+            ClassificationRepository(SupabaseGateway(settings, client), settings),
+            embedder,
+            settings,
+            worker_id=worker.worker_id,
+        )
+
+        def stop() -> None:
+            worker.stop()
+            classifier.stop()
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, worker.stop)
-        await worker.run()
+            # Un seul gestionnaire par signal : un second remplacerait le premier.
+            loop.add_signal_handler(sig, stop)
+        await asyncio.gather(worker.run(), classifier.run())
 
 
 if __name__ == "__main__":

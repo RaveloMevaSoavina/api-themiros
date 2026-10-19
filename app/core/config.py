@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     ingestion_ocr_page_timeout_seconds: int = Field(default=120, gt=0, le=600)
     ingestion_ocr_parallelism: int = Field(default=4, ge=1, le=16)
     ingestion_ner_model: str = "xx_ent_wiki_sm"
+    # E5 — vectorisation des cadres validés pour la classification du corpus.
+    classification_poll_seconds: float = Field(default=10, gt=0, le=300)
 
     @property
     def cors_origins(self) -> list[str]:
