@@ -16,11 +16,13 @@ from app.modules.frameworks.schemas import (
     GeneratePillarsResponse,
     ObservableVariable,
     PillarGenerationContext,
+    PillarTranslation,
     ReferencePillar,
+    VariableTranslation,
 )
 
 PROMPT_CODE = "generate_pillars"
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v1.1"
 EX_ANTE_FORBIDDEN_VARIABLES = {
     "activities_completed_share",
     "beneficiaries_reached",
@@ -35,12 +37,31 @@ EXPECTED_RESULTS_VARIABLES = {
     "expected_results",
     "outcome_indicators_with_targets",
 }
+EXPECTED_RESULTS_PILLAR = {
+    "fr": (
+        "Résultats attendus et dispositif de mesure",
+        "Évalue la formulation des résultats attendus, leurs cibles et "
+        "le dispositif prévu pour les mesurer.",
+    ),
+    "en": (
+        "Expected results and measurement system",
+        "Assesses how expected results and their targets are formulated, "
+        "and the system planned to measure them.",
+    ),
+}
 
 
 class LlmObservableVariable(BaseModel):
     code: str
     label: str
     description: str
+
+
+class LlmPillarTranslation(BaseModel):
+    locale: str
+    name: str
+    description: str
+    observable_variables: list[LlmObservableVariable]
 
 
 class LlmGeneratedPillar(BaseModel):
@@ -50,6 +71,7 @@ class LlmGeneratedPillar(BaseModel):
     criteria_codes: list[str]
     observable_variables: list[LlmObservableVariable]
     weight: float
+    translations: list[LlmPillarTranslation]
 
 
 class LlmPillarOutput(BaseModel):
@@ -129,11 +151,22 @@ class OpenAIPillarGenerator:
 
         try:
             pillars = [
-                GeneratedPillar.model_validate(pillar.model_dump())
+                GeneratedPillar.model_validate(
+                    pillar.model_dump(exclude={"translations"})
+                )
                 for pillar in parsed.pillars
             ]
             pillars = normalize_weights(pillars)
             validate_business_rules(pillars, context, rationale=parsed.rationale)
+            pillars = [
+                with_reference_translations(
+                    sanitize_translations(
+                        pillar, generated.translations, context.translation_locales
+                    ),
+                    context,
+                )
+                for pillar, generated in zip(pillars, parsed.pillars, strict=True)
+            ]
             usage = response.usage
             cost = self._cost(usage)
             if (
@@ -170,7 +203,9 @@ class OpenAIPillarGenerator:
 
     @staticmethod
     def _user_prompt(context: PillarGenerationContext) -> str:
-        inputs = context.model_dump(mode="json", exclude={"prompt"})
+        inputs = context.model_dump(
+            mode="json", exclude={"prompt", "ref_pillar_translations"}
+        )
         return "Contexte de génération (JSON) :\n" + json.dumps(
             inputs,
             ensure_ascii=False,
@@ -210,7 +245,10 @@ class TemplatePillarGenerator:
     ) -> GeneratePillarsResponse:
         started_at = time.perf_counter()
         selected = self._select_references(context)
-        pillars = [self._to_generated(reference, context) for reference in selected]
+        pillars = [
+            with_reference_translations(self._to_generated(reference, context), context)
+            for reference in selected
+        ]
         pillars = normalize_weights(pillars)
         validate_business_rules(pillars, context)
         return GeneratePillarsResponse(
@@ -301,14 +339,22 @@ class TemplatePillarGenerator:
         ]
         name = reference.name
         description = reference.description
+        translations: list[PillarTranslation] = []
         if context.cycle == "ex_ante" and any(
             variable.code in EXPECTED_RESULTS_VARIABLES for variable in variables
         ):
-            name = "Résultats attendus et dispositif de mesure"
-            description = (
-                "Évalue la formulation des résultats attendus, leurs cibles et "
-                "le dispositif prévu pour les mesurer."
+            name, description = EXPECTED_RESULTS_PILLAR.get(
+                context.locale, EXPECTED_RESULTS_PILLAR["fr"]
             )
+            translations = [
+                PillarTranslation(
+                    locale=locale,
+                    name=EXPECTED_RESULTS_PILLAR[locale][0],
+                    description=EXPECTED_RESULTS_PILLAR[locale][1],
+                )
+                for locale in context.translation_locales
+                if locale in EXPECTED_RESULTS_PILLAR
+            ]
         return GeneratedPillar(
             name=name,
             description=description,
@@ -318,6 +364,7 @@ class TemplatePillarGenerator:
             ],
             observable_variables=variables,
             weight=reference.default_weight,
+            translations=translations,
         )
 
 
@@ -344,6 +391,109 @@ class ResilientPillarGenerator:
                 context,
                 fallback_reason=type(error).__name__,
             )
+
+
+def sanitize_translations(
+    pillar: GeneratedPillar,
+    candidates: list[LlmPillarTranslation],
+    locales: list[str],
+) -> GeneratedPillar:
+    """Garde une traduction valide par langue attendue.
+
+    Une traduction invalide est écartée sans faire échouer la génération : le
+    pilier s'affiche alors dans sa langue source.
+    """
+    codes = {variable.code for variable in pillar.observable_variables}
+    translations: dict[str, PillarTranslation] = {}
+    for candidate in candidates:
+        if candidate.locale not in locales or candidate.locale in translations:
+            continue
+        variables: dict[str, VariableTranslation] = {}
+        for variable in candidate.observable_variables:
+            if variable.code not in codes or variable.code in variables:
+                continue
+            try:
+                variables[variable.code] = VariableTranslation.model_validate(
+                    variable.model_dump()
+                )
+            except ValidationError:
+                continue
+        try:
+            translations[candidate.locale] = PillarTranslation(
+                locale=candidate.locale,
+                name=candidate.name,
+                description=candidate.description,
+                observable_variables=list(variables.values()),
+            )
+        except ValidationError:
+            continue
+    return pillar.model_copy(update={"translations": list(translations.values())})
+
+
+def with_reference_translations(
+    pillar: GeneratedPillar, context: PillarGenerationContext
+) -> GeneratedPillar:
+    """Un texte resté celui du référentiel reprend sa traduction officielle.
+
+    Le nom et la description ne sont repris que s'ils sont tous deux inchangés ;
+    chaque variable inchangée (même code, même libellé) l'est séparément.
+    """
+    source = next(
+        (item for item in context.ref_pillars if item.code == pillar.ref_pillar_code),
+        None,
+    )
+    if source is None:
+        return pillar
+    source_variables = {
+        variable.get("code"): variable for variable in source.observable_variables
+    }
+    unchanged = pillar.name == source.name and pillar.description == source.description
+    translations = {item.locale: item for item in pillar.translations}
+    for locale in context.translation_locales:
+        reference = next(
+            (
+                item
+                for item in context.ref_pillar_translations.get(locale, [])
+                if item.code == source.code
+            ),
+            None,
+        )
+        current = translations.get(locale)
+        if reference is None or (current is None and not unchanged):
+            continue
+        reference_variables = {
+            variable.get("code"): variable
+            for variable in reference.observable_variables
+        }
+        variables = {
+            variable.code: variable
+            for variable in (current.observable_variables if current else [])
+        }
+        for variable in pillar.observable_variables:
+            original = source_variables.get(variable.code)
+            translated = reference_variables.get(variable.code)
+            if original and translated and original.get("label") == variable.label:
+                variables[variable.code] = VariableTranslation(
+                    code=variable.code,
+                    label=translated["label"],
+                    description=translated.get("description") or None,
+                )
+        try:
+            translations[locale] = PillarTranslation(
+                locale=locale,
+                name=reference.name if unchanged else current.name,
+                description=(
+                    reference.description if unchanged else current.description
+                ),
+                observable_variables=[
+                    variables[variable.code]
+                    for variable in pillar.observable_variables
+                    if variable.code in variables
+                ],
+            )
+        except ValidationError:
+            continue
+    return pillar.model_copy(update={"translations": list(translations.values())})
 
 
 def normalize_weights(pillars: list[GeneratedPillar]) -> list[GeneratedPillar]:

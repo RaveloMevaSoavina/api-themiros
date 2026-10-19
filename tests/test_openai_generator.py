@@ -9,6 +9,7 @@ from app.modules.frameworks.generator import (
     LlmGeneratedPillar,
     LlmObservableVariable,
     LlmPillarOutput,
+    LlmPillarTranslation,
     OpenAIPillarGenerator,
     ResilientPillarGenerator,
     TemplatePillarGenerator,
@@ -108,10 +109,43 @@ def output(criteria_code: str = "pertinence") -> LlmPillarOutput:
                     )
                 ],
                 weight=20,
+                translations=[],
             )
             for index in range(1, 6)
         ],
         rationale="Adaptation au contexte",
+    )
+
+
+def reference_pillar(index: int, locale: str) -> ReferencePillar:
+    english = locale == "en"
+    return ReferencePillar(
+        code=f"pillar_{index}",
+        name=f"{'Pillar' if english else 'Pilier'} {index}",
+        description="Description",
+        criteria_codes=["pertinence"],
+        observable_variables=[
+            {
+                "code": f"reference_variable_{index}",
+                "label": f"{'Variable EN' if english else 'Variable'} {index}",
+                "description": (
+                    "Observable variable" if english else "Variable observable"
+                ),
+            }
+        ],
+        default_weight=Decimal("20"),
+    )
+
+
+def translated_context() -> PillarGenerationContext:
+    return context().model_copy(
+        update={
+            "locale": "fr",
+            "translation_locales": ["en"],
+            "ref_pillar_translations": {
+                "en": [reference_pillar(index, "en") for index in range(1, 6)]
+            },
+        }
     )
 
 
@@ -210,3 +244,150 @@ async def test_ex_ante_accepts_expected_results_without_achieved_results() -> No
     result = await generator.generate(context().model_copy(update={"cycle": "ex_ante"}))
 
     assert result.generation_mode == "ai"
+
+
+@pytest.mark.asyncio
+async def test_provider_keeps_valid_translations_and_drops_invalid_ones() -> None:
+    generated = output()
+    generated.pillars[0].name = "Pilier adapté"
+    generated.pillars[0].translations = [
+        LlmPillarTranslation(
+            locale="en",
+            name="Adapted pillar",
+            description="Contextualised description",
+            observable_variables=[
+                LlmObservableVariable(
+                    code="variable_1",
+                    label="Variable one",
+                    description="Observable variable",
+                ),
+                LlmObservableVariable(
+                    code="unknown_variable",
+                    label="Unknown",
+                    description="",
+                ),
+            ],
+        ),
+        LlmPillarTranslation(
+            locale="de",
+            name="Angepasste Säule",
+            description="Beschreibung",
+            observable_variables=[],
+        ),
+    ]
+    generated.pillars[1].translations = [
+        LlmPillarTranslation(
+            locale="en",
+            name="x" * 200,
+            description="Too long name",
+            observable_variables=[],
+        )
+    ]
+    generator = OpenAIPillarGenerator(
+        Settings(app_env="test", openai_api_key="test-key"),
+        client=FakeOpenAI(generated),
+    )
+
+    result = await generator.generate(translated_context())
+
+    first, second = result.pillars[0], result.pillars[1]
+    assert result.generation_mode == "ai"
+    assert [item.locale for item in first.translations] == ["en"]
+    assert first.translations[0].name == "Adapted pillar"
+    assert [item.code for item in first.translations[0].observable_variables] == [
+        "variable_1"
+    ]
+    assert second.translations == []
+
+
+@pytest.mark.asyncio
+async def test_unchanged_reference_text_uses_reference_translation() -> None:
+    generated = output()
+    generated.pillars[0].description = "Description"
+    generated.pillars[0].observable_variables = [
+        LlmObservableVariable(
+            code="reference_variable_1",
+            label="Variable 1",
+            description="Variable observable",
+        )
+    ]
+    generated.pillars[0].translations = [
+        LlmPillarTranslation(
+            locale="en",
+            name="Free translation",
+            description="Free description",
+            observable_variables=[],
+        )
+    ]
+    generator = OpenAIPillarGenerator(
+        Settings(app_env="test", openai_api_key="test-key"),
+        client=FakeOpenAI(generated),
+    )
+
+    result = await generator.generate(translated_context())
+
+    translation = result.pillars[0].translations[0]
+    assert translation.name == "Pillar 1"
+    assert translation.description == "Description"
+    assert translation.observable_variables[0].label == "Variable EN 1"
+
+
+@pytest.mark.asyncio
+async def test_prompt_omits_reference_translations() -> None:
+    client = FakeOpenAI(output())
+    generator = OpenAIPillarGenerator(
+        Settings(app_env="test", openai_api_key="test-key"),
+        client=client,
+    )
+
+    await generator.generate(translated_context())
+
+    user_prompt = client.responses.last_request["input"][1]["content"]
+    assert '"translation_locales":["en"]' in user_prompt
+    assert "ref_pillar_translations" not in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_template_translates_from_reference() -> None:
+    result = await TemplatePillarGenerator().generate(translated_context())
+
+    for pillar in result.pillars:
+        assert [item.locale for item in pillar.translations] == ["en"]
+        translation = pillar.translations[0]
+        assert translation.name == pillar.name.replace("Pilier", "Pillar")
+        assert translation.observable_variables[0].label.startswith("Variable EN")
+
+
+@pytest.mark.asyncio
+async def test_template_writes_expected_results_pillar_in_approach_locale() -> None:
+    english_context = translated_context()
+    english_context = english_context.model_copy(
+        update={
+            "cycle": "ex_ante",
+            "locale": "en",
+            "translation_locales": ["fr"],
+            "ref_pillars": [
+                reference.model_copy(
+                    update={
+                        "observable_variables": [
+                            {
+                                "code": "outcome_indicators_with_targets",
+                                "label": "Targets",
+                                "description": "Targets are set",
+                            }
+                        ]
+                    }
+                )
+                for reference in english_context.ref_pillars
+            ],
+            "ref_pillar_translations": {},
+        }
+    )
+
+    result = await TemplatePillarGenerator().generate(english_context)
+
+    assert result.pillars[0].name == "Expected results and measurement system"
+    assert result.pillars[0].translations[0].locale == "fr"
+    assert result.pillars[0].translations[0].name == (
+        "Résultats attendus et dispositif de mesure"
+    )

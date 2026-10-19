@@ -3,6 +3,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+# Langues de l'interface (dashboard-themiros, supportedLanguages) : un pilier
+# est rédigé dans la langue de l'approche et traduit dans les autres.
+INTERFACE_LOCALES = ("fr", "en")
+
 
 class GeneratePillarsRequest(BaseModel):
     workspace_id: UUID
@@ -47,8 +51,14 @@ class PillarGenerationContext(BaseModel):
     instrument_subtype: str
     complexity_class: str
     framework_code: str
+    locale: str = "fr"
+    translation_locales: list[str] = Field(default_factory=list)
     applicable_criteria: list[ApplicableCriterion]
     ref_pillars: list[ReferencePillar]
+    # Piliers du référentiel dans chaque langue de translation_locales.
+    ref_pillar_translations: dict[str, list[ReferencePillar]] = Field(
+        default_factory=dict
+    )
     prompt: PromptDefinition
 
 
@@ -58,6 +68,19 @@ class ObservableVariable(BaseModel):
     description: str | None = Field(default=None, max_length=300)
 
 
+class VariableTranslation(BaseModel):
+    code: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9_]+$")
+    label: str = Field(min_length=1, max_length=160)
+    description: str | None = Field(default=None, max_length=300)
+
+
+class PillarTranslation(BaseModel):
+    locale: str = Field(pattern=r"^(fr|en|pt|es)$")
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=200)
+    observable_variables: list[VariableTranslation] = Field(default_factory=list)
+
+
 class GeneratedPillar(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(min_length=1, max_length=200)
@@ -65,6 +88,7 @@ class GeneratedPillar(BaseModel):
     criteria_codes: list[str] = Field(min_length=1)
     observable_variables: list[ObservableVariable] = Field(min_length=1)
     weight: Decimal = Field(gt=0, le=100, decimal_places=2)
+    translations: list[PillarTranslation] = Field(default_factory=list)
 
 
 class GeneratePillarsResponse(BaseModel):

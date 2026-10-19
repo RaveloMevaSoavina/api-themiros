@@ -6,7 +6,9 @@ from app.api.dependencies import CurrentUser
 from app.core.config import Settings
 from app.core.errors import ApiError
 from app.infrastructure.supabase import SupabaseGateway
+from app.modules.frameworks.generator import PROMPT_CODE, PROMPT_VERSION
 from app.modules.frameworks.schemas import (
+    INTERFACE_LOCALES,
     ApplicableCriterion,
     GeneratePillarsRequest,
     PillarGenerationContext,
@@ -121,20 +123,23 @@ class SupabasePillarContextRepository:
                 "select": "applicability,weight,ref_criteria(code)",
             },
         )
-        reference_rows = await self._gateway.rpc(
-            "get_localized_ref_pillars",
-            token=user.token,
-            payload={
-                "requested_module": approach["instrument_module"],
-                "requested_cycle": approach["cycle"],
-                "requested_locale": approach.get("locale", "fr"),
-            },
-        )
+        locale = approach.get("locale") or "fr"
+        translation_locales = [
+            candidate for candidate in INTERFACE_LOCALES if candidate != locale
+        ]
+        reference_rows = await self._load_ref_pillars(approach, locale, user)
+        reference_translations = {
+            candidate: [
+                ReferencePillar.model_validate(row)
+                for row in await self._load_ref_pillars(approach, candidate, user)
+            ]
+            for candidate in translation_locales
+        }
         prompt_data = await self._gateway.internal_rpc(
             "get_prompt_definition",
             payload={
-                "prompt_code": "generate_pillars",
-                "prompt_version": "v1.0",
+                "prompt_code": PROMPT_CODE,
+                "prompt_version": PROMPT_VERSION,
             },
         )
 
@@ -154,6 +159,8 @@ class SupabasePillarContextRepository:
             instrument_subtype=approach["instrument_subtype"],
             complexity_class=approach["complexity_class"],
             framework_code=framework.get("code", "themiros"),
+            locale=locale,
+            translation_locales=translation_locales,
             applicable_criteria=[
                 ApplicableCriterion(
                     code=row["ref_criteria"]["code"],
@@ -163,7 +170,21 @@ class SupabasePillarContextRepository:
                 for row in criteria_rows
             ],
             ref_pillars=[ReferencePillar.model_validate(row) for row in reference_rows],
+            ref_pillar_translations=reference_translations,
             prompt=PromptDefinition.model_validate(prompt_data),
+        )
+
+    async def _load_ref_pillars(
+        self, approach: dict, locale: str, user: CurrentUser
+    ) -> list[dict]:
+        return await self._gateway.rpc(
+            "get_localized_ref_pillars",
+            token=user.token,
+            payload={
+                "requested_module": approach["instrument_module"],
+                "requested_cycle": approach["cycle"],
+                "requested_locale": locale,
+            },
         )
 
     async def mark_running(self, request: GeneratePillarsRequest) -> None:
