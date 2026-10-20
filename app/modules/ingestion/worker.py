@@ -22,6 +22,8 @@ from app.modules.ingestion.analysis.embeddings import Embedder, build_embedder
 from app.modules.ingestion.errors import is_abandon, is_retryable
 from app.modules.ingestion.pipeline import IngestionPipeline, lease_lost
 from app.modules.ingestion.repository import ClaimedJob, IngestionRepository
+from app.modules.runs.repository import RunRepository
+from app.modules.runs.worker import RunWorker
 
 logger = logging.getLogger(__name__)
 
@@ -164,16 +166,22 @@ async def _main() -> None:
             settings,
             worker_id=worker.worker_id,
         )
+        runner = RunWorker(
+            RunRepository(SupabaseGateway(settings, client), settings),
+            settings,
+            worker_id=worker.worker_id,
+        )
 
         def stop() -> None:
             worker.stop()
             classifier.stop()
+            runner.stop()
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             # Un seul gestionnaire par signal : un second remplacerait le premier.
             loop.add_signal_handler(sig, stop)
-        await asyncio.gather(worker.run(), classifier.run())
+        await asyncio.gather(worker.run(), classifier.run(), runner.run())
 
 
 if __name__ == "__main__":

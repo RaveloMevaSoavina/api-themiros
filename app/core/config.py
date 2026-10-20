@@ -62,6 +62,16 @@ class Settings(BaseSettings):
     ingestion_ner_model: str = "xx_ent_wiki_sm"
     # E5 — vectorisation des cadres validés pour la classification du corpus.
     classification_poll_seconds: float = Field(default=10, gt=0, le=300)
+    # E6 — runs d'analyse. Similarité « forte » d'une détection : seuil de la
+    # valeur 1 d'une variable, à recalibrer sur le corpus de référence.
+    run_poll_seconds: float = Field(default=5, gt=0, le=300)
+    run_lease_seconds: int = Field(default=300, ge=60, le=3600)
+    run_strong_similarity: float = Field(default=0.55, gt=0, le=1)
+    run_max_evidences_per_variable: int = Field(default=10, ge=1, le=100)
+    # Un run attend la classification du corpus (cadre tout juste validé)
+    # au plus ce délai, en se remettant en file toutes les run_defer_seconds.
+    run_classification_wait_seconds: int = Field(default=3600, ge=60, le=86400)
+    run_defer_seconds: int = Field(default=30, ge=5, le=600)
 
     @property
     def cors_origins(self) -> list[str]:

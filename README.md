@@ -64,6 +64,23 @@ Endpoints from the API catalogue (§6):
 - `POST /api/v1/ingestion/full`: complete asynchronous ingestion (202)
 - `GET /api/v1/jobs/{id}`: ingestion job status
 
+## Analysis runs (E6, layer A)
+
+The dashboard launches a run with the Supabase function `create_run`, which
+freezes the corpus and queues the run. The worker process also consumes that
+queue (`app/modules/runs`): it reads the frozen inputs (`run_inputs`), computes
+intermediate variables, corpus confidence and layer A scores in pure Python
+(`domain.py`), then writes everything in one transaction (`complete_run`).
+Layers B and C are not computed yet: their steps are marked `skipped`.
+
+Variable scoring is deterministic: 1 (`present`) when strong detections
+(similarity ≥ `RUN_STRONG_SIMILARITY`, default 0.55) come from at least the
+workspace's number of independent sources, 0.5 (`partiel`) for any other
+detection, `non_renseigne` otherwise. The engine never concludes absence (0).
+The thresholds and `ENGINE_VERSION` are stored in each run's `rules_applied`.
+A run whose corpus classification is still pending is deferred
+(`RUN_DEFER_SECONDS`) for at most `RUN_CLASSIFICATION_WAIT_SECONDS`.
+
 ## Tests and quality
 
 ```bash
