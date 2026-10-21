@@ -273,7 +273,10 @@ class RunWorker:
                 raw, usage = await self._grader.grade(prompt, batch)
             except GradingUnavailable as error:
                 logger.warning(
-                    "Run %s: layer B grading unavailable (%s)", run.run_id, error.code
+                    "Run %s: layer B grading unavailable (%s: %s)",
+                    run.run_id,
+                    error.code,
+                    error.message,
                 )
                 ai["errors"].append(error.code)
                 continue

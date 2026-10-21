@@ -82,10 +82,10 @@ class OpenAISubQuestionGrader:
     ) -> tuple[RawGrading, AiUsage]:
         parameters = prompt.get("parameters") or {}
         model = prompt.get("model") or self._settings.openai_model
-        max_output_tokens = min(
-            int(parameters.get("max_tokens", 6000)),
-            # Marge pour la structure JSON de la réponse.
-            batch.max_output_tokens + 500,
+        # Plafond du prompt, pas l'estimation du lot : le raisonnement du
+        # modèle consomme le même budget et tronquerait la sortie JSON.
+        max_output_tokens = max(
+            int(parameters.get("max_tokens", 6000)), batch.max_output_tokens + 500
         )
         estimate = ai_cost(
             self._settings, batch.estimated_input_tokens, max_output_tokens
@@ -123,14 +123,26 @@ class OpenAISubQuestionGrader:
                 "AI_PROVIDER_AUTHENTICATION_FAILED",
                 "La clé du fournisseur IA est invalide",
             ) from error
-        except (openai.APIError, ValidationError) as error:
+        except openai.APIError as error:
             raise GradingUnavailable(
-                "AI_PROVIDER_RESPONSE_INVALID",
-                "Le fournisseur IA a rejeté la requête ou rendu une sortie invalide",
+                "AI_PROVIDER_REJECTED",
+                f"Le fournisseur IA a rejeté la requête : {error.message}"[:300],
+            ) from error
+        except ValidationError as error:
+            # Le SDK valide le JSON produit : une sortie coupée échoue ici.
+            raise GradingUnavailable(
+                "AI_OUTPUT_TRUNCATED",
+                "La sortie IA est incomplète ou ne suit pas le schéma",
             ) from error
 
         parsed = response.output_parsed
-        if parsed is None or getattr(response, "status", None) == "incomplete":
+        if getattr(response, "status", None) == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            raise GradingUnavailable(
+                "AI_OUTPUT_TRUNCATED",
+                f"La sortie IA est incomplète ({getattr(details, 'reason', None)})",
+            )
+        if parsed is None:
             raise GradingUnavailable(
                 "AI_PROVIDER_RESPONSE_INVALID",
                 "Le fournisseur IA n'a retourné aucune sortie exploitable",

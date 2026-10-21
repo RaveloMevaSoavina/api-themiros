@@ -98,7 +98,7 @@ async def test_one_structured_call_returns_the_ratings_and_their_cost() -> None:
     assert request["model"] == "test-llm"
     assert request["text_format"] is LlmGradingOutput
     assert request["temperature"] == 0
-    assert request["max_output_tokens"] == batch.max_output_tokens + 500
+    assert request["max_output_tokens"] == 6000
     assert request["input"][0]["content"] == "Noter les sous-questions."
     assert request["input"][1]["content"] == batch.message()
     assert raw.grades[0].key == "Q1" and raw.grades[0].note == 2
@@ -131,7 +131,7 @@ async def test_the_estimated_cost_is_checked_before_calling() -> None:
             "AI_PROVIDER_UNAVAILABLE",
         ),
         ({"output": None}, "AI_PROVIDER_RESPONSE_INVALID"),
-        ({"output": OUTPUT, "status": "incomplete"}, "AI_PROVIDER_RESPONSE_INVALID"),
+        ({"output": OUTPUT, "status": "incomplete"}, "AI_OUTPUT_TRUNCATED"),
     ],
 )
 async def test_provider_failures_make_the_grading_unavailable(kwargs, code) -> None:
