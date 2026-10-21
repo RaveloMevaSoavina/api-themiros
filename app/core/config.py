@@ -77,15 +77,18 @@ class Settings(BaseSettings):
     # avec l'ancien modèle local. L'IA écarte ensuite les extraits hors sujet.
     # Les extraits soumis à l'IA sont limités et tronqués pour contenir le
     # nombre de tokens ; au-delà du plafond d'entrée, les critères sont
-    # répartis sur plusieurs appels.
+    # répartis sur plusieurs appels. Avec 3 extraits de 600 caractères, l'IA
+    # laissait un tiers des sous-questions sans preuve et notait surtout 1-2 ;
+    # 6 extraits de 1 200 caractères (~32 000 tokens pour 51 sous-questions)
+    # tiennent toujours en un seul appel.
     run_layer_b_min_similarity: float = Field(default=0.32, gt=0, le=1)
-    run_layer_b_top_k: int = Field(default=5, ge=1, le=20)
+    run_layer_b_top_k: int = Field(default=8, ge=1, le=20)
     # Sous-questions par appel de recherche : la base coupe une requête
     # au-delà de 8 s.
     run_layer_b_match_batch_size: int = Field(default=8, ge=1, le=100)
-    run_layer_b_excerpts_per_question: int = Field(default=3, ge=1, le=10)
-    run_layer_b_excerpt_chars: int = Field(default=600, ge=100, le=4000)
-    run_layer_b_max_input_tokens: int = Field(default=30000, ge=1000, le=400000)
+    run_layer_b_excerpts_per_question: int = Field(default=6, ge=1, le=10)
+    run_layer_b_excerpt_chars: int = Field(default=1200, ge=100, le=4000)
+    run_layer_b_max_input_tokens: int = Field(default=80000, ge=1000, le=400000)
     run_layer_b_timeout_seconds: float = Field(default=120, gt=0, le=600)
 
     @property

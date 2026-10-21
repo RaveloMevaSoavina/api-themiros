@@ -278,7 +278,7 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     steps = [(name, status) for name, status, _ in repository.steps]
     assert ("layer_b", "running") in steps and ("layer_b", "completed") in steps
     assert ("layer_c", "skipped") in steps
-    assert repository.queries == [("test-model", [q.id for q in QUESTIONS], 5)]
+    assert repository.queries == [("test-model", [q.id for q in QUESTIONS], 8)]
     (results,) = repository.completed
     (note,) = results["layer_b"]["notes"]
     assert note["status"] == "conclu" and note["note"] == 3.0
