@@ -14,15 +14,16 @@ RUN apt-get update \
       tesseract-ocr-por tesseract-ocr-spa \
     && rm -rf /var/lib/apt/lists/*
 
-# Modèle d'embeddings embarqué dans l'image : le worker ne télécharge rien
-# au démarrage.
+# Modèle d'embeddings local embarqué dans l'image, pour
+# INGESTION_EMBEDDING_PROVIDER=local : le worker ne télécharge rien au
+# démarrage. Par défaut, les embeddings viennent d'OpenAI.
 ENV INGESTION_EMBEDDING_CACHE_DIR=/opt/fastembed
 
 COPY pyproject.toml README.md ./
 COPY app ./app
 RUN pip install ".[nlp]" \
     && python -m spacy download xx_ent_wiki_sm \
-    && python -c "from app.core.config import Settings; from app.modules.ingestion.analysis.embeddings import load_local_model; s = Settings(); load_local_model(s.ingestion_embedding_model, '/opt/fastembed', None)" \
+    && python -c "from app.modules.ingestion.analysis.embeddings import CUSTOM_LOCAL_MODELS, load_local_model; [load_local_model(model, '/opt/fastembed', None) for model in CUSTOM_LOCAL_MODELS]" \
     && groupadd --system app \
     && useradd --system --gid app --home-dir /app --no-create-home app \
     && chown -R app:app /app /opt/fastembed
