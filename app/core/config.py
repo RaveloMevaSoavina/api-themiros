@@ -62,10 +62,13 @@ class Settings(BaseSettings):
     # E5 — vectorisation des cadres validés pour la classification du corpus.
     classification_poll_seconds: float = Field(default=10, gt=0, le=300)
     # E6 — runs d'analyse. Similarité « forte » d'une détection : seuil de la
-    # valeur 1 d'une variable, à recalibrer sur le corpus de référence.
+    # valeur 1 d'une variable, propre au modèle d'embeddings. 0,43 avec
+    # text-embedding-3-large garde la même part de détections fortes (14 %)
+    # que 0,55 avec l'ancien modèle local, que le nouveau n'atteint presque
+    # jamais (toutes les variables restaient à 0,5).
     run_poll_seconds: float = Field(default=5, gt=0, le=300)
     run_lease_seconds: int = Field(default=300, ge=60, le=3600)
-    run_strong_similarity: float = Field(default=0.55, gt=0, le=1)
+    run_strong_similarity: float = Field(default=0.43, gt=0, le=1)
     run_max_evidences_per_variable: int = Field(default=10, ge=1, le=100)
     # Un run attend la classification du corpus (cadre tout juste validé)
     # au plus ce délai, en se remettant en file toutes les run_defer_seconds.
