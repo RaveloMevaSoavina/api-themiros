@@ -12,9 +12,15 @@ from openai import AsyncOpenAI
 
 from app.core.config import Settings
 from app.core.errors import ApiError
+from app.modules.ingestion.analysis.segmenter import count_tokens
 from app.modules.ingestion.errors import IngestionError, embedding_unavailable
 
 RETRY_ATTEMPTS = 3
+# Limites de l'API embeddings : 2 048 entrées et 300 000 tokens par requête
+# (marge pour l'écart de tokenizer).
+OPENAI_MAX_BATCH_INPUTS = 2048
+OPENAI_MAX_BATCH_TOKENS = 250_000
+OPENAI_CONCURRENT_REQUESTS = 4
 
 
 class Embedder(Protocol):
@@ -158,12 +164,14 @@ class LocalEmbedder:
 
 class OpenAIEmbedder:
     """`text-embedding-3-*` réduit à la dimension de l'index, normalisation
-    L2, 3 tentatives avec backoff."""
+    L2, 3 tentatives avec backoff.
+
+    Les lots sont aussi gros que l'API le permet et partent en parallèle : un
+    document de 200 segments tient en une requête au lieu de sept en série."""
 
     def __init__(self, settings: Settings, client: AsyncOpenAI | None = None) -> None:
         self.model = settings.ingestion_embedding_model
         self._dimensions = settings.ingestion_embedding_dimensions
-        self._batch_size = settings.ingestion_embedding_batch_size
         self._client = client
         if client is None and settings.openai_api_key:
             self._client = AsyncOpenAI(
@@ -179,11 +187,24 @@ class OpenAIEmbedder:
                 code="AI_PROVIDER_NOT_CONFIGURED",
                 detail="OPENAI_API_KEY est requis pour l'analyse sémantique",
             )
-        vectors: list[list[float]] = []
-        for start in range(0, len(texts), self._batch_size):
-            batch = list(texts[start : start + self._batch_size])
-            vectors.extend(await self._embed_batch(batch))
-        return vectors
+        if not texts:
+            return []
+        tokens = await asyncio.to_thread(lambda: [count_tokens(text) for text in texts])
+        semaphore = asyncio.Semaphore(OPENAI_CONCURRENT_REQUESTS)
+
+        async def run(start: int, end: int) -> list[list[float]]:
+            async with semaphore:
+                return await self._embed_batch(list(texts[start:end]))
+
+        results = await asyncio.gather(
+            *(
+                run(start, end)
+                for start, end in token_batches(
+                    tokens, OPENAI_MAX_BATCH_INPUTS, OPENAI_MAX_BATCH_TOKENS
+                )
+            )
+        )
+        return [vector for batch in results for vector in batch]
 
     async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         for attempt in range(RETRY_ATTEMPTS):
@@ -210,6 +231,24 @@ class OpenAIEmbedder:
                     context={"upstream_status": error.status_code},
                 ) from error
         raise embedding_unavailable()
+
+
+def token_batches(
+    tokens: Sequence[int], max_inputs: int, max_tokens: int
+) -> list[tuple[int, int]]:
+    """Bornes [début, fin) de lots consécutifs sous les limites de l'API."""
+    batches: list[tuple[int, int]] = []
+    start, total = 0, 0
+    for index, count in enumerate(tokens):
+        if index > start and (
+            index - start >= max_inputs or total + count > max_tokens
+        ):
+            batches.append((start, index))
+            start, total = index, 0
+        total += count
+    if start < len(tokens):
+        batches.append((start, len(tokens)))
+    return batches
 
 
 def l2_normalize(vector: Sequence[float]) -> list[float]:

@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     ingestion_embedding_provider: Literal["local", "openai"] = "openai"
     ingestion_embedding_model: str = "text-embedding-3-large"
     ingestion_embedding_dimensions: int = Field(default=768, gt=0)
+    # Modèle local uniquement : OpenAI regroupe selon les limites de son API.
     ingestion_embedding_batch_size: int = Field(default=32, ge=1, le=2048)
     ingestion_embedding_cache_dir: str | None = None
     ingestion_embedding_threads: int | None = Field(default=None, ge=1, le=64)

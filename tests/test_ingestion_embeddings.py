@@ -9,6 +9,7 @@ from app.modules.ingestion.analysis.embeddings import (
     build_embedder,
     sample_indices,
     split_windows,
+    token_batches,
 )
 from app.modules.ingestion.errors import is_retryable
 
@@ -102,3 +103,35 @@ def test_sample_indices_spread_over_the_document():
     assert sample_indices(3, 32) == [0, 1, 2]
     assert sample_indices(5, 1) == [2]
     assert sample_indices(0, 32) == []
+
+
+def test_token_batches_respect_input_and_token_limits():
+    assert token_batches([10] * 5, 2, 1000) == [(0, 2), (2, 4), (4, 5)]
+    assert token_batches([60, 50, 40, 70], 10, 100) == [(0, 1), (1, 3), (3, 4)]
+    # Une entrée seule au-delà du budget part quand même, dans son propre lot.
+    assert token_batches([500, 10], 10, 100) == [(0, 1), (1, 2)]
+    assert token_batches([], 10, 100) == []
+
+
+async def test_openai_embedder_keeps_input_order_across_batches(monkeypatch):
+    from app.modules.ingestion.analysis import embeddings
+
+    monkeypatch.setattr(embeddings, "OPENAI_MAX_BATCH_INPUTS", 2)
+    calls: list[list[str]] = []
+
+    class FakeEmbeddings:
+        async def create(self, *, model, dimensions, input):
+            calls.append(input)
+            data = [
+                type("Item", (), {"embedding": [float(int(text)), 1.0, 0.0]})
+                for text in input
+            ]
+            return type("Response", (), {"data": data})
+
+    client = type("Client", (), {"embeddings": FakeEmbeddings()})()
+    embedder = OpenAIEmbedder(settings(), client=client)
+
+    vectors = await embedder.embed(["1", "2", "3", "4", "5"])
+
+    assert len(calls) == 3
+    assert [round(vector[0] / vector[1]) for vector in vectors] == [1, 2, 3, 4, 5]

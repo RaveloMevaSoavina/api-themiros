@@ -13,6 +13,10 @@ RUN apt-get update \
       tesseract-ocr tesseract-ocr-fra tesseract-ocr-eng \
       tesseract-ocr-por tesseract-ocr-spa \
     && rm -rf /var/lib/apt/lists/*
+# Les pages sont déjà OCRisées en parallèle (un processus Tesseract par page) :
+# le multithreading OpenMP interne de Tesseract surcharge alors le CPU et
+# ralentit l'ensemble (recommandation de la documentation Tesseract).
+ENV OMP_THREAD_LIMIT=1
 
 # Modèle d'embeddings local embarqué dans l'image, pour
 # INGESTION_EMBEDDING_PROVIDER=local : le worker ne télécharge rien au

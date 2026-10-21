@@ -54,7 +54,8 @@ from app.modules.ingestion.repository import (
 )
 
 StageCallback = Callable[[str], Awaitable[None]]
-SEGMENT_BATCH_SIZE = 32
+# ~10 Ko par segment (texte + vecteur 768) : ~1,3 Mo par appel.
+SEGMENT_BATCH_SIZE = 128
 OCR_LANGUAGES = {"fr": "fra", "en": "eng", "pt": "por", "es": "spa"}
 
 
