@@ -90,10 +90,10 @@ async def test_local_embedder_skips_empty_input():
 
 
 def test_provider_selects_embedder():
-    assert isinstance(build_embedder(Settings()), LocalEmbedder)
+    assert isinstance(build_embedder(Settings()), OpenAIEmbedder)
     assert isinstance(
-        build_embedder(Settings(ingestion_embedding_provider="openai")),
-        OpenAIEmbedder,
+        build_embedder(Settings(ingestion_embedding_provider="local")),
+        LocalEmbedder,
     )
 
 

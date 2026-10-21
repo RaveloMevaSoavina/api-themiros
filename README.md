@@ -38,13 +38,13 @@ scoring against the workspace fingerprint, decision, segmentation and indexing.
 .venv/bin/python -m app.modules.ingestion.worker
 ```
 
-The worker needs `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. It computes
-embeddings locally with fastembed (`paraphrase-multilingual-mpnet-base-v2`,
-int8 ONNX, 768 dimensions, CPU). The model is baked into the Docker image under
-`/opt/fastembed`; locally it is downloaded once to
-`INGESTION_EMBEDDING_CACHE_DIR`. Set `INGESTION_EMBEDDING_PROVIDER=openai` with
-`OPENAI_API_KEY` and `INGESTION_EMBEDDING_MODEL=text-embedding-3-small` to use
-OpenAI instead; changing the model requires reindexing. The relevance score
+The worker needs `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and
+`OPENAI_API_KEY`. It computes embeddings with OpenAI `text-embedding-3-large`
+reduced to 768 dimensions. `INGESTION_EMBEDDING_PROVIDER=local` switches back
+to fastembed (`paraphrase-multilingual-mpnet-base-v2`, int8 ONNX, CPU, baked
+into the Docker image under `/opt/fastembed`). Changing the model requires
+reindexing the corpus (`python -m app.modules.ingestion.reindex`, before the
+workers restart) and recalibrating the similarity thresholds. The relevance score
 embeds an evenly spread sample of segments (`INGESTION_RELEVANCE_SAMPLE_SEGMENTS`,
 default 32); the remaining segments are embedded at indexing time, only for
 compliant or human-approved documents.

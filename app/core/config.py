@@ -38,15 +38,14 @@ class Settings(BaseSettings):
     ingestion_worker_poll_seconds: float = Field(default=2, gt=0, le=60)
     ingestion_worker_lease_seconds: int = Field(default=300, ge=60, le=3600)
     ingestion_worker_concurrency: int = Field(default=2, ge=1, le=16)
-    # Embeddings calculés localement (fastembed, ONNX) par défaut ; `openai`
-    # reste possible avec un modèle `text-embedding-3-*` réduit à 768.
-    # Changer de modèle impose de réindexer tout le corpus.
-    ingestion_embedding_provider: Literal["local", "openai"] = "local"
-    # Version int8 du modèle : ~3 fois plus rapide sur CPU, vecteurs quasi
-    # identiques (similarité ≥ 0,99 avec la version complète).
-    ingestion_embedding_model: str = (
-        "sentence-transformers/paraphrase-multilingual-mpnet-base-v2-int8"
-    )
+    # OpenAI `text-embedding-3-large` réduit à 768 dimensions : entraîné pour
+    # retrouver le passage qui répond à une question, y compris d'une langue à
+    # l'autre (questions en français, corpus en anglais), ce que le modèle
+    # local de paraphrases (`local`, fastembed) fait mal. Changer de modèle
+    # impose de réindexer le corpus (`app.modules.ingestion.reindex`) et de
+    # recalibrer les seuils de similarité.
+    ingestion_embedding_provider: Literal["local", "openai"] = "openai"
+    ingestion_embedding_model: str = "text-embedding-3-large"
     ingestion_embedding_dimensions: int = Field(default=768, gt=0)
     ingestion_embedding_batch_size: int = Field(default=32, ge=1, le=2048)
     ingestion_embedding_cache_dir: str | None = None
@@ -73,12 +72,13 @@ class Settings(BaseSettings):
     run_classification_wait_seconds: int = Field(default=3600, ge=60, le=86400)
     run_defer_seconds: int = Field(default=30, ge=5, le=600)
     # E9 — couche B. Similarité minimale d'un extrait avec une sous-question :
-    # la spec dit 0,7, que le modèle local n'atteint pas (voir la
-    # classification, 0,40) ; l'IA écarte ensuite les extraits hors sujet.
+    # la spec dit 0,7, qu'aucun modèle n'atteint ; 0,32 avec
+    # text-embedding-3-large laisse passer la même part du corpus que 0,40
+    # avec l'ancien modèle local. L'IA écarte ensuite les extraits hors sujet.
     # Les extraits soumis à l'IA sont limités et tronqués pour contenir le
     # nombre de tokens ; au-delà du plafond d'entrée, les critères sont
     # répartis sur plusieurs appels.
-    run_layer_b_min_similarity: float = Field(default=0.40, gt=0, le=1)
+    run_layer_b_min_similarity: float = Field(default=0.32, gt=0, le=1)
     run_layer_b_top_k: int = Field(default=5, ge=1, le=20)
     # Sous-questions par appel de recherche : la base coupe une requête
     # au-delà de 8 s.
