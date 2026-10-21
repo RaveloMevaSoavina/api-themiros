@@ -72,23 +72,29 @@ class RunRepository:
         queries: list[tuple[UUID, list[float]]],
         top_k: int,
     ) -> list[Candidate]:
-        rows = await self._gateway.service_rpc(
-            "run_sub_question_matches",
-            payload={
-                **self._lease(run),
-                "p_model": model,
-                "p_queries": [
-                    {
-                        "sub_question_id": str(question_id),
-                        "embedding": vector_literal(vector),
-                    }
-                    for question_id, vector in queries
-                ],
-                "p_top_k": top_k,
-            },
-            request_timeout=120,
-        )
-        return [Candidate.from_row(row) for row in rows or []]
+        """Recherche exacte : son coût croît avec le nombre de sous-questions,
+        d'où des lots qui tiennent chacun sous le statement_timeout."""
+        size = self._settings.run_layer_b_match_batch_size
+        candidates: list[Candidate] = []
+        for start in range(0, len(queries), size):
+            rows = await self._gateway.service_rpc(
+                "run_sub_question_matches",
+                payload={
+                    **self._lease(run),
+                    "p_model": model,
+                    "p_queries": [
+                        {
+                            "sub_question_id": str(question_id),
+                            "embedding": vector_literal(vector),
+                        }
+                        for question_id, vector in queries[start : start + size]
+                    ],
+                    "p_top_k": top_k,
+                },
+                request_timeout=120,
+            )
+            candidates.extend(Candidate.from_row(row) for row in rows or [])
+        return candidates
 
     async def prompt(self, code: str, version: str) -> dict[str, Any]:
         row = await self._gateway.service_rpc(

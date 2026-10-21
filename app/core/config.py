@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     # répartis sur plusieurs appels.
     run_layer_b_min_similarity: float = Field(default=0.40, gt=0, le=1)
     run_layer_b_top_k: int = Field(default=5, ge=1, le=20)
+    # Sous-questions par appel de recherche : la base coupe une requête
+    # au-delà de 8 s.
+    run_layer_b_match_batch_size: int = Field(default=8, ge=1, le=100)
     run_layer_b_excerpts_per_question: int = Field(default=3, ge=1, le=10)
     run_layer_b_excerpt_chars: int = Field(default=600, ge=100, le=4000)
     run_layer_b_max_input_tokens: int = Field(default=30000, ge=1000, le=400000)

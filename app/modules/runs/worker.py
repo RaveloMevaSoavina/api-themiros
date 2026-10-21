@@ -192,7 +192,13 @@ class RunWorker:
             else:
                 logger.exception("Run %s failed at step %s", run.run_id, step)
                 code, message = "RUN_FAILED", "Le calcul de l'analyse a échoué"
-            logger.warning("Run %s failed at step %s: %s", run.run_id, step, code)
+            logger.warning(
+                "Run %s failed at step %s: %s %s",
+                run.run_id,
+                step,
+                code,
+                error.context if isinstance(error, ApiError) else "",
+            )
             try:
                 await self._repository.fail(run, step, code, message)
             except Exception:

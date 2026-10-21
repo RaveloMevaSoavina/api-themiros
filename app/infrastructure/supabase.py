@@ -182,9 +182,12 @@ class SupabaseGateway:
     @staticmethod
     def _service_error(response: httpx.Response) -> ApiError:
         message = ""
+        upstream_code = ""
         try:
             body = response.json()
-            message = str(body.get("message") or "") if isinstance(body, dict) else ""
+            if isinstance(body, dict):
+                message = str(body.get("message") or "")
+                upstream_code = str(body.get("code") or "")
         except ValueError:
             pass
         if response.status_code < 500 and message.isupper() and " " not in message:
@@ -194,11 +197,24 @@ class SupabaseGateway:
                 detail=message,
                 context={"upstream_status": response.status_code},
             )
+        context = {
+            "upstream_status": response.status_code,
+            "upstream_code": upstream_code,
+            "upstream_message": message[:300],
+        }
+        # 57014 : statement_timeout de Postgres (8 s pour les rôles de l'API).
+        if upstream_code == "57014":
+            return ApiError(
+                status_code=503,
+                code="DATABASE_TIMEOUT",
+                detail="Supabase a interrompu une requête trop longue",
+                context=context,
+            )
         return ApiError(
             status_code=503,
             code="DATABASE_UNAVAILABLE",
-            detail="Supabase n'a pas pu traiter la demande d'ingestion",
-            context={"upstream_status": response.status_code},
+            detail="Supabase n'a pas pu traiter la requête",
+            context=context,
         )
 
     def _rest_url(self, path: str) -> str:
