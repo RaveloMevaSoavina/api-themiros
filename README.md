@@ -64,14 +64,28 @@ Endpoints from the API catalogue (§6):
 - `POST /api/v1/ingestion/full`: complete asynchronous ingestion (202)
 - `GET /api/v1/jobs/{id}`: ingestion job status
 
-## Analysis runs (E6, layer A)
+## Analysis runs (E6, layers A and B)
 
 The dashboard launches a run with the Supabase function `create_run`, which
 freezes the corpus and queues the run. The worker process also consumes that
 queue (`app/modules/runs`): it reads the frozen inputs (`run_inputs`), computes
 intermediate variables, corpus confidence and layer A scores in pure Python
-(`domain.py`), then writes everything in one transaction (`complete_run`).
-Layers B and C are not computed yet: their steps are marked `skipped`.
+(`domain.py`), computes layer B (below), then writes everything in one
+transaction (`complete_run`). Layer C is not computed yet: its step is marked
+`skipped`.
+
+Layer B (`layer_b.py`, `grader.py`) rates each retained criterion 0-3. Each
+active sub-question is embedded with the segment model and matched against the
+run's frozen corpus (`run_sub_question_matches`, top `RUN_LAYER_B_TOP_K`
+above `RUN_LAYER_B_MIN_SIMILARITY`, default 0.40). Criteria with fewer than 50%
+of their sub-questions matched are `non_conclu` without any AI call. The others
+are rated by the `grade_sub_questions` prompt in a single AI call per run
+(split only beyond `RUN_LAYER_B_MAX_INPUT_TOKENS`), with deduplicated,
+truncated excerpts (`RUN_LAYER_B_EXCERPTS_PER_QUESTION`,
+`RUN_LAYER_B_EXCERPT_CHARS`). A rating counts only if it cites one of the
+question's own excerpts. When AI is disabled or fails, no rating is produced:
+criteria stay `non_conclu` and the run still completes. AI usage (model,
+tokens, cost, errors) is stored in `rules_applied.engine.layer_b.ai`.
 
 Variable scoring is deterministic: 1 (`present`) when strong detections
 (similarity ≥ `RUN_STRONG_SIMILARITY`, default 0.55) come from at least the

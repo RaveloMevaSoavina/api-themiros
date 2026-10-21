@@ -72,6 +72,18 @@ class Settings(BaseSettings):
     # au plus ce délai, en se remettant en file toutes les run_defer_seconds.
     run_classification_wait_seconds: int = Field(default=3600, ge=60, le=86400)
     run_defer_seconds: int = Field(default=30, ge=5, le=600)
+    # E9 — couche B. Similarité minimale d'un extrait avec une sous-question :
+    # la spec dit 0,7, que le modèle local n'atteint pas (voir la
+    # classification, 0,40) ; l'IA écarte ensuite les extraits hors sujet.
+    # Les extraits soumis à l'IA sont limités et tronqués pour contenir le
+    # nombre de tokens ; au-delà du plafond d'entrée, les critères sont
+    # répartis sur plusieurs appels.
+    run_layer_b_min_similarity: float = Field(default=0.40, gt=0, le=1)
+    run_layer_b_top_k: int = Field(default=5, ge=1, le=20)
+    run_layer_b_excerpts_per_question: int = Field(default=3, ge=1, le=10)
+    run_layer_b_excerpt_chars: int = Field(default=600, ge=100, le=4000)
+    run_layer_b_max_input_tokens: int = Field(default=30000, ge=1000, le=400000)
+    run_layer_b_timeout_seconds: float = Field(default=120, gt=0, le=600)
 
     @property
     def cors_origins(self) -> list[str]:

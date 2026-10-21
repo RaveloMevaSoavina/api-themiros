@@ -1,8 +1,8 @@
 """File des runs d'analyse, avec la clé serveur.
 
 Les écritures passent par les fonctions SQL des migrations
-`20261020000002_analysis_runs.sql` et `20261020000003_run_results.sql`,
-conditionnées au bail.
+`20261020000002_analysis_runs.sql`, `20261020000003_run_results.sql` et
+`20261021000002_layer_b.sql`, conditionnées au bail.
 """
 
 from dataclasses import dataclass
@@ -11,7 +11,9 @@ from uuid import UUID
 
 from app.core.config import Settings
 from app.infrastructure.supabase import SupabaseGateway
+from app.modules.ingestion.repository import vector_literal
 from app.modules.runs.domain import RunInputs
+from app.modules.runs.layer_b import Candidate, LayerBInputs
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +58,44 @@ class RunRepository:
             "run_inputs", payload=self._lease(run), request_timeout=60
         )
         return RunInputs.from_row(row)
+
+    async def layer_b_inputs(self, run: ClaimedRun) -> LayerBInputs:
+        row = await self._gateway.service_rpc(
+            "run_layer_b_inputs", payload=self._lease(run), request_timeout=60
+        )
+        return LayerBInputs.from_row(row or {})
+
+    async def sub_question_matches(
+        self,
+        run: ClaimedRun,
+        model: str,
+        queries: list[tuple[UUID, list[float]]],
+        top_k: int,
+    ) -> list[Candidate]:
+        rows = await self._gateway.service_rpc(
+            "run_sub_question_matches",
+            payload={
+                **self._lease(run),
+                "p_model": model,
+                "p_queries": [
+                    {
+                        "sub_question_id": str(question_id),
+                        "embedding": vector_literal(vector),
+                    }
+                    for question_id, vector in queries
+                ],
+                "p_top_k": top_k,
+            },
+            request_timeout=120,
+        )
+        return [Candidate.from_row(row) for row in rows or []]
+
+    async def prompt(self, code: str, version: str) -> dict[str, Any]:
+        row = await self._gateway.service_rpc(
+            "get_prompt_definition",
+            payload={"prompt_code": code, "prompt_version": version},
+        )
+        return row if isinstance(row, dict) else {}
 
     async def step(
         self,
