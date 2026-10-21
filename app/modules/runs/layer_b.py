@@ -201,6 +201,8 @@ class SubAnswerResult:
     note: int | None
     contradictory: bool
     evidences: list[Candidate]
+    # Critère de la sous-question : la couche C y rattache ses preuves.
+    criterion_id: UUID | None = None
 
 
 @dataclass(slots=True)
@@ -512,6 +514,7 @@ def finalize(
                     note=grade.note if grade else None,
                     contradictory=grade.contradictory if grade else False,
                     evidences=evidences,
+                    criterion_id=criterion.id,
                 )
             )
 

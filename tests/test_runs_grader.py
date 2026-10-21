@@ -9,10 +9,14 @@ import pytest
 from app.core.config import Settings
 from app.modules.runs.grader import (
     GradingUnavailable,
+    LlmAlert,
     LlmCriterionJustification,
     LlmGrade,
     LlmGradingOutput,
+    LlmQualificationOutput,
+    OpenAIAlertQualifier,
     OpenAISubQuestionGrader,
+    build_alert_qualifier,
     build_sub_question_grader,
 )
 from app.modules.runs.layer_b import (
@@ -24,6 +28,15 @@ from app.modules.runs.layer_b import (
     build_batches,
     retrieve,
 )
+from app.modules.runs.layer_c import (
+    RULES,
+    Alert,
+    LayerCInputs,
+    LayerCRules,
+    PillarCriterion,
+    RawQualification,
+)
+from app.modules.runs.layer_c import build_batches as build_alert_batches
 
 PROMPT = {
     "code": "grade_sub_questions",
@@ -146,3 +159,58 @@ async def test_provider_failures_make_the_grading_unavailable(kwargs, code) -> N
 def test_no_grader_when_ai_is_disabled() -> None:
     assert build_sub_question_grader(Settings(ai_provider="disabled")) is None
     assert build_sub_question_grader(_settings()) is not None
+
+
+def _qualification_batch():
+    pillar, criterion, version = uuid4(), uuid4(), uuid4()
+    inputs = LayerCInputs(
+        "fr",
+        {pillar: "Budget"},
+        (PillarCriterion(pillar, criterion, "pertinence", "Pertinence"),),
+    )
+    alert = Alert(
+        id=uuid4(),
+        rule=RULES["ALERT-01"],
+        severity="majeure",
+        pillar_id=pillar,
+        pillar_name="Budget",
+        criterion_id=criterion,
+        criterion_name="Pertinence",
+        program_version_id=version,
+        score=62,
+        note=1,
+        delta=None,
+        confidence=0.8,
+        segment_ids=[uuid4()],
+        message="Écart.",
+    )
+    (batch,) = build_alert_batches(
+        inputs, [alert], {alert.segment_ids[0]: "Extrait."}, LayerCRules()
+    )
+    return batch
+
+
+async def test_one_structured_call_qualifies_the_gaps() -> None:
+    output = LlmQualificationOutput(
+        a=[LlmAlert(k="A1", ok=True, g="mineure", m="Écart explicable.", e=["E1"])]
+    )
+    client = FakeOpenAI(output=output)
+    batch = _qualification_batch()
+    prompt = {**PROMPT, "parameters": {"max_tokens": 2000}}
+
+    raw, usage = await OpenAIAlertQualifier(_settings(), client).qualify(prompt, batch)
+
+    request = client.responses.last_request
+    assert request["text_format"] is LlmQualificationOutput
+    assert request["max_output_tokens"] == 2000
+    assert "temperature" not in request
+    assert request["input"][1]["content"] == batch.message()
+    assert raw == [
+        RawQualification("A1", True, "mineure", "Écart explicable.", ("E1",))
+    ]
+    assert usage.cost_eur == Decimal("0.004800")
+
+
+def test_no_qualifier_when_ai_is_disabled() -> None:
+    assert build_alert_qualifier(Settings(ai_provider="disabled")) is None
+    assert build_alert_qualifier(_settings()) is not None

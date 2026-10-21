@@ -21,6 +21,7 @@ from app.modules.runs.layer_b import (
     RawGrading,
     SubQuestion,
 )
+from app.modules.runs.layer_c import LayerCInputs, PillarCriterion, RawQualification
 from app.modules.runs.repository import ClaimedRun
 from app.modules.runs.worker import RunWorker
 
@@ -77,6 +78,18 @@ class FakeRepository:
         self.layer_b_value = LayerBInputs(locale="fr", cycle="mi_parcours", criteria=())
         self.matches: list[Candidate] = []
         self.queries: list = []
+        self.layer_c_value = LayerCInputs(locale="fr", pillar_names={}, links=())
+        self.text_requests: list[list[UUID]] = []
+        self.texts: dict[UUID, str] = {}
+
+    async def layer_c_inputs(self, run):
+        return self.layer_c_value
+
+    async def segment_texts(self, run, segment_ids):
+        self.text_requests.append(list(segment_ids))
+        return {
+            segment: self.texts.get(segment, "Extrait A.") for segment in segment_ids
+        }
 
     async def layer_b_inputs(self, run):
         return self.layer_b_value
@@ -118,7 +131,9 @@ def _worker(repository) -> RunWorker:
 async def test_empty_queue_does_nothing() -> None:
     repository = FakeRepository([], _inputs())
     assert await _worker(repository).run_once() is False
-    assert repository.claims == [("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0")]
+    assert repository.claims == [
+        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0")
+    ]
 
 
 async def test_a_run_goes_through_the_named_steps_and_publishes_layer_a() -> None:
@@ -133,7 +148,8 @@ async def test_a_run_goes_through_the_named_steps_and_publishes_layer_a() -> Non
         ("variables", "completed"),
         ("layer_a", "completed"),
         ("layer_b", "skipped"),
-        ("layer_c", "skipped"),
+        ("layer_c", "running"),
+        ("layer_c", "completed"),
         ("restitution", "running"),
     ]
     assert repository.steps[1][2] == {
@@ -228,8 +244,9 @@ class FakeEmbedder:
 
 
 class FakeGrader:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, note: int = 3) -> None:
         self.error = error
+        self.note = note
         self.calls = 0
 
     async def grade(self, prompt, batch):
@@ -239,7 +256,12 @@ class FakeGrader:
         return (
             RawGrading(
                 grades=tuple(
-                    RawGrade(key, 3, tuple(sorted(batch.allowed[question_id])), False)
+                    RawGrade(
+                        key,
+                        self.note,
+                        tuple(sorted(batch.allowed[question_id])),
+                        False,
+                    )
                     for key, question_id in batch.question_keys.items()
                 ),
                 justifications={"C1": "Alignement net avec les priorités."},
@@ -277,7 +299,7 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     assert grader.calls == 1
     steps = [(name, status) for name, status, _ in repository.steps]
     assert ("layer_b", "running") in steps and ("layer_b", "completed") in steps
-    assert ("layer_c", "skipped") in steps
+    assert ("layer_c", "completed") in steps
     assert repository.queries == [("test-model", [q.id for q in QUESTIONS], 8)]
     (results,) = repository.completed
     (note,) = results["layer_b"]["notes"]
@@ -331,3 +353,143 @@ async def test_no_ai_call_when_no_criterion_is_documented_enough() -> None:
     (results,) = repository.completed
     assert results["rules"]["layer_b"]["ai"]["status"] == "not_needed"
     assert results["layer_b"]["notes"][0]["documented_sub_questions"] == 0
+
+
+class FakeQualifier:
+    def __init__(self, error: Exception | None = None, confirmed: bool = True) -> None:
+        self.error = error
+        self.confirmed = confirmed
+        self.batches: list = []
+
+    async def qualify(self, prompt, batch):
+        self.batches.append(batch)
+        if self.error:
+            raise self.error
+        return (
+            [
+                RawQualification(
+                    key,
+                    self.confirmed,
+                    "majeure",
+                    "Budget bien documenté, pertinence faiblement étayée.",
+                    tuple(batch.allowed[alert_id])[:1],
+                )
+                for key, alert_id in batch.alert_keys.items()
+            ],
+            AiUsage("test-llm", 900, 60, Decimal("0.0012")),
+        )
+
+
+def _layer_c_repository() -> FakeRepository:
+    """Score A de 100 pour le pilier, note B de 1 pour son critère : un
+    écart ALERT-01."""
+    repository = _layer_b_repository()
+    pillar = repository.inputs_value.pillars[0].id
+    repository.layer_c_value = LayerCInputs(
+        "fr",
+        {pillar: "Budget et absorption"},
+        (PillarCriterion(pillar, CRITERION.id, CRITERION.code, CRITERION.name),),
+    )
+    return repository
+
+
+def _layer_c_worker(repository, qualifier) -> RunWorker:
+    return RunWorker(
+        repository,
+        Settings(),
+        worker_id="host-1",
+        embedder=FakeEmbedder(),
+        grader=FakeGrader(note=1),
+        qualifier=qualifier,
+    )
+
+
+async def test_layer_c_qualifies_every_gap_in_a_single_ai_call() -> None:
+    repository = _layer_c_repository()
+    qualifier = FakeQualifier()
+
+    await _layer_c_worker(repository, qualifier).run_once()
+
+    assert len(qualifier.batches) == 1
+    # Les extraits de la couche B sont déjà lus ; seuls ceux de la couche A
+    # sont demandés.
+    (requested,) = repository.text_requests
+    b_segments = {candidate.segment_id for candidate in repository.matches}
+    assert requested and not set(requested) & b_segments
+    (results,) = repository.completed
+    (alert,) = results["layer_c"]["alerts"]
+    assert alert["rule_code"] == "ALERT-01" and alert["severity"] == "majeure"
+    assert alert["qualified"] is True
+    assert alert["message"] == "Budget bien documenté, pertinence faiblement étayée."
+    assert len(alert["segment_ids"]) == 1
+    ai = results["rules"]["layer_c"]["ai"]
+    assert ai["status"] == "completed" and ai["calls"] == 1
+    assert ai["prompt"] == "detect_incoherence_v1.0"
+    assert results["rules"]["layer_c"]["engine_version"] == "layer-c/1.0.0"
+    summary = next(
+        s for n, st, s in repository.steps if (n, st) == ("layer_c", "completed")
+    )
+    assert summary["alerts"] == 1 and summary["qualified"] == 1
+    assert repository.failures == []
+
+
+async def test_without_ai_the_gaps_are_published_unqualified() -> None:
+    repository = _layer_c_repository()
+
+    await _layer_c_worker(repository, None).run_once()
+
+    (results,) = repository.completed
+    (alert,) = results["layer_c"]["alerts"]
+    assert alert["qualified"] is False and alert["severity"] == "majeure"
+    assert alert["message"].startswith("Budget et absorption : amélioration")
+    # Deux extraits du critère (couche B), puis deux du pilier (couche A).
+    assert len(alert["segment_ids"]) == 4
+    ai = results["rules"]["layer_c"]["ai"]
+    assert ai["status"] == "unavailable" and ai["errors"] == ["AI_DISABLED"]
+    assert repository.text_requests == []
+
+
+async def test_a_gap_infirmed_by_the_ai_is_not_published() -> None:
+    repository = _layer_c_repository()
+
+    await _layer_c_worker(repository, FakeQualifier(confirmed=False)).run_once()
+
+    (results,) = repository.completed
+    assert results["layer_c"]["alerts"] == []
+    summary = next(
+        s for n, st, s in repository.steps if (n, st) == ("layer_c", "completed")
+    )
+    assert summary["detected"] == 1 and summary["infirmed"] == 1
+
+
+async def test_a_qualification_failure_does_not_fail_the_run() -> None:
+    repository = _layer_c_repository()
+    qualifier = FakeQualifier(GradingUnavailable("AI_PROVIDER_UNAVAILABLE", "down"))
+
+    await _layer_c_worker(repository, qualifier).run_once()
+
+    (results,) = repository.completed
+    (alert,) = results["layer_c"]["alerts"]
+    assert alert["qualified"] is False
+    assert results["rules"]["layer_c"]["ai"]["errors"] == ["AI_PROVIDER_UNAVAILABLE"]
+    assert repository.failures == []
+
+
+async def test_no_ai_call_when_the_layers_agree() -> None:
+    repository = _layer_c_repository()
+    qualifier = FakeQualifier()
+    worker = RunWorker(
+        repository,
+        Settings(),
+        worker_id="host-1",
+        embedder=FakeEmbedder(),
+        grader=FakeGrader(note=3),
+        qualifier=qualifier,
+    )
+
+    await worker.run_once()
+
+    assert qualifier.batches == []
+    (results,) = repository.completed
+    assert results["layer_c"]["alerts"] == []
+    assert results["rules"]["layer_c"]["ai"]["status"] == "not_needed"

@@ -1,8 +1,9 @@
 """File des runs d'analyse, avec la clé serveur.
 
 Les écritures passent par les fonctions SQL des migrations
-`20261020000002_analysis_runs.sql`, `20261020000003_run_results.sql` et
-`20261021000002_layer_b.sql`, conditionnées au bail.
+`20261020000002_analysis_runs.sql`, `20261020000003_run_results.sql`,
+`20261021000002_layer_b.sql` et `20261021000005_layer_c.sql`, conditionnées
+au bail.
 """
 
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from app.infrastructure.supabase import SupabaseGateway
 from app.modules.ingestion.repository import vector_literal
 from app.modules.runs.domain import RunInputs
 from app.modules.runs.layer_b import Candidate, LayerBInputs
+from app.modules.runs.layer_c import LayerCInputs
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +97,27 @@ class RunRepository:
             )
             candidates.extend(Candidate.from_row(row) for row in rows or [])
         return candidates
+
+    async def layer_c_inputs(self, run: ClaimedRun) -> LayerCInputs:
+        row = await self._gateway.service_rpc(
+            "run_layer_c_inputs", payload=self._lease(run), request_timeout=60
+        )
+        return LayerCInputs.from_row(row or {})
+
+    async def segment_texts(
+        self, run: ClaimedRun, segment_ids: list[UUID]
+    ) -> dict[UUID, str]:
+        if not segment_ids:
+            return {}
+        row = await self._gateway.service_rpc(
+            "run_segment_texts",
+            payload={
+                **self._lease(run),
+                "p_segment_ids": [str(segment) for segment in segment_ids],
+            },
+            request_timeout=60,
+        )
+        return {UUID(key): text for key, text in (row or {}).items()}
 
     async def prompt(self, code: str, version: str) -> dict[str, Any]:
         row = await self._gateway.service_rpc(

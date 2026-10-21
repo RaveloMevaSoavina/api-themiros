@@ -1,11 +1,11 @@
 """Exécution des runs d'analyse (E6) : classification figée, variables
-intermédiaires, couche A, couche B, restitution.
+intermédiaires, couche A, couche B, couche C, restitution.
 
 Tourne dans le processus du worker d'ingestion, avec son modèle
-d'embeddings (recherche des extraits de la couche B). La couche C arrive au
-sprint suivant : son étape est marquée « skipped ». Un échec passe le run en
-`failed` sans rien publier (RG-6.1) ; une IA indisponible n'est pas un
-échec : les critères de la couche B restent non conclus.
+d'embeddings (recherche des extraits de la couche B). Un échec passe le run
+en `failed` sans rien publier (RG-6.1) ; une IA indisponible n'est pas un
+échec : les critères de la couche B restent non conclus, les écarts de la
+couche C gardent leur qualification par défaut.
 """
 
 import asyncio
@@ -19,12 +19,14 @@ from app.core.errors import ApiError
 from app.modules.ingestion.analysis.embeddings import Embedder
 from app.modules.runs.domain import (
     ENGINE_VERSION,
+    LayerAResults,
     RunInputs,
     ScoringRules,
     compute_layer_a,
 )
 from app.modules.runs.grader import (
     AiUsage,
+    AlertQualifier,
     GradingUnavailable,
     SubQuestionGrader,
 )
@@ -41,12 +43,23 @@ from app.modules.runs.layer_b import (
     interpret,
     retrieve,
 )
+from app.modules.runs.layer_c import (
+    LAYER_C_VERSION,
+    LayerCResults,
+    LayerCRules,
+    detect,
+    known_texts,
+)
+from app.modules.runs.layer_c import PROMPT_CODE as ALERT_PROMPT_CODE
+from app.modules.runs.layer_c import PROMPT_VERSION as ALERT_PROMPT_VERSION
+from app.modules.runs.layer_c import build_batches as build_alert_batches
+from app.modules.runs.layer_c import interpret as interpret_alerts
 from app.modules.runs.repository import ClaimedRun, RunRepository
 
 logger = logging.getLogger(__name__)
 
 NOT_AVAILABLE = {"reason": "not_available"}
-RUN_ENGINE_VERSION = f"{ENGINE_VERSION}+{LAYER_B_VERSION}"
+RUN_ENGINE_VERSION = f"{ENGINE_VERSION}+{LAYER_B_VERSION}+{LAYER_C_VERSION}"
 
 
 class RunFailure(Exception):
@@ -65,15 +78,18 @@ class RunWorker:
         worker_id: str,
         embedder: Embedder | None = None,
         grader: SubQuestionGrader | None = None,
+        qualifier: AlertQualifier | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
         self._worker_id = f"{worker_id}#runs"
         self._stopping = asyncio.Event()
         # Sans modèle d'embeddings, la couche B n'est pas calculée ; sans
-        # IA, ses critères restent non conclus.
+        # IA, ses critères restent non conclus et les écarts de la couche C
+        # ne sont pas qualifiés.
         self._embedder = embedder
         self._grader = grader
+        self._qualifier = qualifier
 
     def stop(self) -> None:
         self._stopping.set()
@@ -155,6 +171,7 @@ class RunWorker:
 
             step = "layer_b"
             payload = results.payload(rules)
+            layer_b: LayerBResults | None = None
             if self._embedder is None:
                 await self._repository.step(run, step, "skipped", NOT_AVAILABLE)
             else:
@@ -167,17 +184,28 @@ class RunWorker:
                     **payload["rules"],
                     "layer_b": {**layer_b_rules.as_dict(), "ai": layer_b.ai},
                 }
-            await self._repository.step(run, "layer_c", "skipped", NOT_AVAILABLE)
+
+            step = "layer_c"
+            await self._repository.step(run, step, "running")
+            layer_c_rules = LayerCRules()
+            layer_c = await self._layer_c(run, results, layer_b, layer_c_rules)
+            await self._repository.step(run, step, "completed", layer_c.summary())
+            payload["layer_c"] = layer_c.payload()
+            payload["rules"] = {
+                **payload["rules"],
+                "layer_c": {**layer_c_rules.as_dict(), "ai": layer_c.ai},
+            }
 
             step = "restitution"
             await self._repository.step(run, step, "running")
             written = await self._repository.complete(run, payload)
             logger.info(
-                "Run %s completed: %s variables, %s evidences, %s scores",
+                "Run %s completed: %s variables, %s evidences, %s scores, %s alerts",
                 run.run_id,
                 written.get("variables"),
                 written.get("evidences"),
                 written.get("scores"),
+                written.get("alerts"),
             )
         except asyncio.CancelledError:
             raise
@@ -246,18 +274,8 @@ class RunWorker:
             return grading, {**ai, "status": "not_needed"}
         if self._grader is None:
             return grading, {**ai, "status": "unavailable", "errors": ["AI_DISABLED"]}
-        try:
-            prompt = await self._repository.prompt(PROMPT_CODE, PROMPT_VERSION)
-        except ApiError as error:
-            if error.code == "RUN_LEASE_LOST":
-                raise
-            logger.warning("Run %s: grading prompt unavailable", run.run_id)
-            return grading, {
-                **ai,
-                "status": "unavailable",
-                "errors": ["PROMPT_UNAVAILABLE"],
-            }
-        if not prompt.get("template"):
+        prompt = await self._prompt(run, PROMPT_CODE, PROMPT_VERSION)
+        if prompt is None:
             return grading, {
                 **ai,
                 "status": "unavailable",
@@ -283,6 +301,97 @@ class RunWorker:
             usages.append(usage)
             interpret(batch, raw, grading)
 
+        return grading, self._usage(ai, usages, len(batches))
+
+    async def _layer_c(
+        self,
+        run: ClaimedRun,
+        layer_a: LayerAResults,
+        layer_b: LayerBResults | None,
+        rules: LayerCRules,
+    ) -> LayerCResults:
+        inputs = await self._repository.layer_c_inputs(run)
+        alerts = detect(inputs, layer_a, layer_b, rules)
+        ai: dict = {
+            "prompt": f"{ALERT_PROMPT_CODE}_{ALERT_PROMPT_VERSION}",
+            "batches": 0,
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_eur": "0",
+            "errors": [],
+        }
+        if not alerts:
+            return LayerCResults([], 0, {**ai, "status": "not_needed"})
+        if self._qualifier is None:
+            return LayerCResults(
+                alerts,
+                len(alerts),
+                {**ai, "status": "unavailable", "errors": ["AI_DISABLED"]},
+            )
+        prompt = await self._prompt(run, ALERT_PROMPT_CODE, ALERT_PROMPT_VERSION)
+        if prompt is None:
+            return LayerCResults(
+                alerts,
+                len(alerts),
+                {**ai, "status": "unavailable", "errors": ["PROMPT_UNAVAILABLE"]},
+            )
+
+        # Texte des extraits : ceux de la couche B sont déjà lus, ceux de la
+        # couche A sont demandés en une fois.
+        texts = known_texts(layer_b)
+        missing = list(
+            dict.fromkeys(
+                segment
+                for alert in alerts
+                for segment in alert.segment_ids
+                if segment not in texts
+            )
+        )
+        texts.update(await self._repository.segment_texts(run, missing))
+        batches = build_alert_batches(inputs, alerts, texts, rules)
+        ai["batches"] = len(batches)
+
+        infirmed: set = set()
+        usages: list[AiUsage] = []
+        for index, batch in enumerate(batches):
+            if index:
+                # Prolonge le bail entre deux appels.
+                await self._repository.step(run, "layer_c", "running")
+            try:
+                raw, usage = await self._qualifier.qualify(prompt, batch)
+            except GradingUnavailable as error:
+                logger.warning(
+                    "Run %s: layer C qualification unavailable (%s: %s)",
+                    run.run_id,
+                    error.code,
+                    error.message,
+                )
+                ai["errors"].append(error.code)
+                continue
+            usages.append(usage)
+            infirmed |= interpret_alerts(batch, raw, rules)
+
+        return LayerCResults(
+            [alert for alert in alerts if alert.id not in infirmed],
+            len(alerts),
+            self._usage(ai, usages, len(batches)),
+        )
+
+    async def _prompt(self, run: ClaimedRun, code: str, version: str) -> dict | None:
+        """Prompt actif, ou `None` s'il est introuvable : l'étape continue
+        sans IA."""
+        try:
+            prompt = await self._repository.prompt(code, version)
+        except ApiError as error:
+            if error.code == "RUN_LEASE_LOST":
+                raise
+            logger.warning("Run %s: prompt %s unavailable", run.run_id, code)
+            return None
+        return prompt if prompt.get("template") else None
+
+    @staticmethod
+    def _usage(ai: dict, usages: list[AiUsage], batches: int) -> dict:
         ai["calls"] = len(usages)
         ai["input_tokens"] = sum(usage.input_tokens for usage in usages)
         ai["output_tokens"] = sum(usage.output_tokens for usage in usages)
@@ -291,12 +400,12 @@ class RunWorker:
             ai["model"] = usages[0].model
         ai["status"] = (
             "completed"
-            if len(usages) == len(batches)
+            if len(usages) == batches
             else "partial"
             if usages
             else "unavailable"
         )
-        return grading, ai
+        return ai
 
     def _may_wait(self, inputs: RunInputs) -> bool:
         waited = (datetime.now(UTC) - inputs.created_at).total_seconds()

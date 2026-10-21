@@ -22,7 +22,10 @@ from app.modules.ingestion.analysis.embeddings import Embedder, build_embedder
 from app.modules.ingestion.errors import is_abandon, is_retryable
 from app.modules.ingestion.pipeline import IngestionPipeline, lease_lost
 from app.modules.ingestion.repository import ClaimedJob, IngestionRepository
-from app.modules.runs.grader import build_sub_question_grader
+from app.modules.runs.grader import (
+    build_alert_qualifier,
+    build_sub_question_grader,
+)
 from app.modules.runs.repository import RunRepository
 from app.modules.runs.worker import RunWorker
 
@@ -173,6 +176,7 @@ async def _main() -> None:
             worker_id=worker.worker_id,
             embedder=embedder,
             grader=build_sub_question_grader(settings),
+            qualifier=build_alert_qualifier(settings),
         )
 
         def stop() -> None:
