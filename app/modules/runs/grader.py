@@ -1,12 +1,14 @@
 """Appels IA du moteur de runs, en sortie structurée :
 
 - notation des sous-questions de la couche B (prompt grade_sub_questions) ;
-- qualification des écarts de la couche C (prompt detect_incoherence).
+- qualification des écarts de la couche C (prompt detect_incoherence) ;
+- rédaction de la restitution (prompt formulate_restitution).
 
 Un appel par lot (un seul lot en pratique). Toute défaillance (IA
 désactivée, réseau, réponse invalide, plafond de coût) lève
 `GradingUnavailable` : les critères du lot restent non conclus, les écarts
-gardent leur qualification par défaut ; le run continue.
+gardent leur qualification par défaut, la synthèse ses libellés factuels ;
+le run continue.
 """
 
 from dataclasses import dataclass
@@ -20,6 +22,14 @@ from pydantic import BaseModel, ValidationError
 from app.core.config import Settings
 from app.modules.runs.layer_b import GradingBatch, RawGrade, RawGrading
 from app.modules.runs.layer_c import QualificationBatch, RawQualification
+from app.modules.runs.restitution import (
+    PERSONA_KEYS,
+    RawAction,
+    RawItem,
+    RawProjection,
+    RawRestitution,
+    RestitutionBatch,
+)
 
 MILLION = Decimal("1000000")
 
@@ -61,6 +71,31 @@ class LlmQualificationOutput(BaseModel):
     a: list[LlmAlert]
 
 
+class LlmRestitutionItem(BaseModel):
+    k: str
+    t: str
+    e: list[str]
+
+
+class LlmProjection(BaseModel):
+    t: str
+    j: str
+
+
+class LlmRestitutionAction(BaseModel):
+    k: str
+    e: list[str]
+    dec: LlmProjection
+    pmu: LlmProjection
+    ana: LlmProjection
+
+
+class LlmRestitutionOutput(BaseModel):
+    i: list[LlmRestitutionItem]
+    c: str
+    a: list[LlmRestitutionAction]
+
+
 @dataclass(frozen=True, slots=True)
 class AiUsage:
     model: str
@@ -79,6 +114,12 @@ class AlertQualifier(Protocol):
     async def qualify(
         self, prompt: dict[str, Any], batch: QualificationBatch
     ) -> tuple[list[RawQualification], AiUsage]: ...
+
+
+class RestitutionWriter(Protocol):
+    async def write(
+        self, prompt: dict[str, Any], batch: RestitutionBatch
+    ) -> tuple[RawRestitution, AiUsage]: ...
 
 
 def ai_cost(settings: Settings, input_tokens: int, output_tokens: int) -> Decimal:
@@ -234,6 +275,42 @@ class OpenAIAlertQualifier(OpenAIStructuredCall):
         )
 
 
+class OpenAIRestitutionWriter(OpenAIStructuredCall):
+    async def write(
+        self, prompt: dict[str, Any], batch: RestitutionBatch
+    ) -> tuple[RawRestitution, AiUsage]:
+        parsed, usage = await self._parse(
+            prompt,
+            batch.message(),
+            LlmRestitutionOutput,
+            batch.estimated_input_tokens,
+            batch.max_output_tokens,
+            3000,
+        )
+        return (
+            RawRestitution(
+                items=tuple(
+                    RawItem(item.k, item.t, tuple(item.e)) for item in parsed.i
+                ),
+                conclusion=parsed.c,
+                actions=tuple(
+                    RawAction(
+                        item.k,
+                        tuple(item.e),
+                        {
+                            persona: RawProjection(
+                                getattr(item, key).t, getattr(item, key).j
+                            )
+                            for persona, key in PERSONA_KEYS.items()
+                        },
+                    )
+                    for item in parsed.a
+                ),
+            ),
+            usage,
+        )
+
+
 def build_sub_question_grader(settings: Settings) -> SubQuestionGrader | None:
     """`None` quand l'IA est désactivée : la couche B ne note rien."""
     if settings.ai_provider != "openai" or not settings.openai_api_key:
@@ -247,3 +324,11 @@ def build_alert_qualifier(settings: Settings) -> AlertQualifier | None:
     if settings.ai_provider != "openai" or not settings.openai_api_key:
         return None
     return OpenAIAlertQualifier(settings)
+
+
+def build_restitution_writer(settings: Settings) -> RestitutionWriter | None:
+    """`None` quand l'IA est désactivée : la synthèse garde ses libellés
+    factuels, sans conclusion ni plan d'action."""
+    if settings.ai_provider != "openai" or not settings.openai_api_key:
+        return None
+    return OpenAIRestitutionWriter(settings)

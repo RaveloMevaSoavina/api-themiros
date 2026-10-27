@@ -7,16 +7,23 @@ import openai
 import pytest
 
 from app.core.config import Settings
+from app.modules.runs.domain import LayerAResults
 from app.modules.runs.grader import (
     GradingUnavailable,
     LlmAlert,
     LlmCriterionJustification,
     LlmGrade,
     LlmGradingOutput,
+    LlmProjection,
     LlmQualificationOutput,
+    LlmRestitutionAction,
+    LlmRestitutionItem,
+    LlmRestitutionOutput,
     OpenAIAlertQualifier,
+    OpenAIRestitutionWriter,
     OpenAISubQuestionGrader,
     build_alert_qualifier,
+    build_restitution_writer,
     build_sub_question_grader,
 )
 from app.modules.runs.layer_b import (
@@ -37,6 +44,12 @@ from app.modules.runs.layer_c import (
     RawQualification,
 )
 from app.modules.runs.layer_c import build_batches as build_alert_batches
+from app.modules.runs.restitution import (
+    RawProjection,
+    RestitutionRules,
+    build_batch,
+    select,
+)
 
 PROMPT = {
     "code": "grade_sub_questions",
@@ -214,3 +227,48 @@ async def test_one_structured_call_qualifies_the_gaps() -> None:
 def test_no_qualifier_when_ai_is_disabled() -> None:
     assert build_alert_qualifier(Settings(ai_provider="disabled")) is None
     assert build_alert_qualifier(_settings()) is not None
+
+
+async def test_one_structured_call_writes_the_restitution() -> None:
+    batch = _qualification_batch()
+    alert = batch.alerts[0]
+    inputs = LayerCInputs("fr", {alert.pillar_id: "Budget"}, ())
+    restitution = select(
+        inputs, LayerAResults([], []), None, [alert], RestitutionRules()
+    )
+    restitution_batch = build_batch(
+        "fr", restitution, {alert.segment_ids[0]: "Extrait."}, RestitutionRules()
+    )
+    assert restitution_batch is not None
+    projection = LlmProjection(t="Vérifier l'écart.", j="l'écart est majeur")
+    output = LlmRestitutionOutput(
+        i=[LlmRestitutionItem(k="V1", t="Écart à vérifier.", e=["E1"])],
+        c="Les résultats suggèrent un écart.",
+        a=[
+            LlmRestitutionAction(
+                k="V1", e=["E1"], dec=projection, pmu=projection, ana=projection
+            )
+        ],
+    )
+    client = FakeOpenAI(output=output)
+    prompt = {**PROMPT, "parameters": {"max_tokens": 3000}}
+
+    raw, _ = await OpenAIRestitutionWriter(_settings(), client).write(
+        prompt, restitution_batch
+    )
+
+    request = client.responses.last_request
+    assert request["text_format"] is LlmRestitutionOutput
+    assert request["max_output_tokens"] == 3000
+    assert request["input"][1]["content"] == restitution_batch.message()
+    assert raw.conclusion == "Les résultats suggèrent un écart."
+    (action,) = raw.actions
+    assert set(action.projections) == {"decideur", "pmu", "analyste"}
+    assert action.projections["analyste"] == RawProjection(
+        "Vérifier l'écart.", "l'écart est majeur"
+    )
+
+
+def test_no_restitution_writer_when_ai_is_disabled() -> None:
+    assert build_restitution_writer(Settings(ai_provider="disabled")) is None
+    assert build_restitution_writer(_settings()) is not None

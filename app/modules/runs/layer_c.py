@@ -307,7 +307,7 @@ def match_rule(
     return None
 
 
-def _ordered_segments(items: Iterable[tuple[UUID, float]]) -> list[UUID]:
+def ordered_segments(items: Iterable[tuple[UUID, float]]) -> list[UUID]:
     """Segments les plus proches d'abord, chacun une seule fois."""
     best: dict[UUID, float] = {}
     for segment_id, similarity in items:
@@ -354,10 +354,10 @@ def detect(
         scores_by_pillar[score.pillar_id].append(score)
 
     def evidences(pillar: PillarScore, criterion_id: UUID | None = None) -> list[UUID]:
-        segments = _ordered_segments(criterion_matches.get(criterion_id, ()))
+        segments = ordered_segments(criterion_matches.get(criterion_id, ()))
         segments += [
             segment
-            for segment in _ordered_segments(
+            for segment in ordered_segments(
                 pillar_matches.get((pillar.pillar_id, pillar.program_version_id), ())
             )
             if segment not in segments

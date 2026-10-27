@@ -23,6 +23,12 @@ from app.modules.runs.layer_b import (
 )
 from app.modules.runs.layer_c import LayerCInputs, PillarCriterion, RawQualification
 from app.modules.runs.repository import ClaimedRun
+from app.modules.runs.restitution import (
+    RawAction,
+    RawItem,
+    RawProjection,
+    RawRestitution,
+)
 from app.modules.runs.worker import RunWorker
 
 VERSION = UUID("55555555-5555-4555-8555-555555555555")
@@ -132,7 +138,7 @@ async def test_empty_queue_does_nothing() -> None:
     repository = FakeRepository([], _inputs())
     assert await _worker(repository).run_once() is False
     assert repository.claims == [
-        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0")
+        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0+restitution/1.0.0")
     ]
 
 
@@ -493,3 +499,118 @@ async def test_no_ai_call_when_the_layers_agree() -> None:
     (results,) = repository.completed
     assert results["layer_c"]["alerts"] == []
     assert results["rules"]["layer_c"]["ai"]["status"] == "not_needed"
+
+
+class FakeWriter:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.batches: list = []
+
+    async def write(self, prompt, batch):
+        self.batches.append(batch)
+        if self.error:
+            raise self.error
+        projections = {
+            persona: RawProjection(f"Action ({persona}).", "le critère est faible")
+            for persona in ("decideur", "pmu", "analyste")
+        }
+        return (
+            RawRestitution(
+                items=tuple(
+                    RawItem(key, f"Constat {key}.", tuple(batch.allowed[key])[:1])
+                    for key, finding in batch.findings.items()
+                    if finding.section is not None
+                ),
+                conclusion="Les résultats suggèrent une pertinence à étayer.",
+                actions=tuple(
+                    RawAction(key, tuple(batch.allowed[key])[:1], projections)
+                    for key in batch.origins
+                ),
+            ),
+            AiUsage("test-llm", 1500, 400, Decimal("0.0030")),
+        )
+
+
+def _restitution_worker(repository, writer) -> RunWorker:
+    return RunWorker(
+        repository,
+        Settings(),
+        worker_id="host-1",
+        embedder=FakeEmbedder(),
+        grader=FakeGrader(note=1),
+        qualifier=FakeQualifier(),
+        writer=writer,
+    )
+
+
+async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
+    repository = _layer_c_repository()
+    writer = FakeWriter()
+
+    await _restitution_worker(repository, writer).run_once()
+
+    assert len(writer.batches) == 1
+    (results,) = repository.completed
+    restitution = results["restitution"]
+    # Pertinence (note 1) est une faiblesse ; l'alerte ALERT-01 est à vérifier.
+    assert [item["section"] for item in restitution["items"]] == [
+        "faiblesse",
+        "a_verifier",
+    ]
+    assert restitution["items"][0]["text"] == "Constat W1."
+    assert restitution["synthesis"]["qualified"] is True
+    assert restitution["synthesis"]["conclusion"].startswith("Les résultats")
+    assert [action["origin_type"] for action in restitution["actions"]] == [
+        "criterion",
+        "alert",
+    ]
+    assert all(len(action["projections"]) == 3 for action in restitution["actions"])
+    rules = results["rules"]["restitution"]
+    assert rules["engine_version"] == "restitution/1.0.0"
+    assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
+    assert rules["ai"]["prompt"] == "formulate_restitution_v1.0"
+    assert results["summary"]["actions"] == 2
+    assert repository.failures == []
+
+
+async def test_without_ai_the_synthesis_keeps_factual_labels() -> None:
+    repository = _layer_c_repository()
+
+    await _restitution_worker(repository, None).run_once()
+
+    (results,) = repository.completed
+    restitution = results["restitution"]
+    assert restitution["items"][0]["text"] == "Pertinence : note 1.0/3."
+    assert restitution["synthesis"] == {
+        "conclusion": None,
+        "limits": restitution["synthesis"]["limits"],
+        "qualified": False,
+    }
+    assert restitution["actions"] == []
+    ai = results["rules"]["restitution"]["ai"]
+    assert ai["status"] == "unavailable" and ai["errors"] == ["AI_DISABLED"]
+
+
+async def test_a_writing_failure_does_not_fail_the_run() -> None:
+    repository = _layer_c_repository()
+    writer = FakeWriter(GradingUnavailable("AI_OUTPUT_TRUNCATED", "cut"))
+
+    await _restitution_worker(repository, writer).run_once()
+
+    (results,) = repository.completed
+    assert results["restitution"]["synthesis"]["qualified"] is False
+    assert results["restitution"]["actions"] == []
+    assert results["rules"]["restitution"]["ai"]["errors"] == ["AI_OUTPUT_TRUNCATED"]
+    assert repository.failures == []
+
+
+async def test_an_empty_restitution_needs_no_ai_call() -> None:
+    repository = FakeRepository([_run()], _inputs())
+    writer = FakeWriter()
+
+    await _restitution_worker(repository, writer).run_once()
+
+    assert writer.batches == []
+    (results,) = repository.completed
+    assert results["restitution"]["items"] == []
+    assert results["rules"]["restitution"]["ai"]["status"] == "not_needed"

@@ -64,15 +64,14 @@ Endpoints from the API catalogue (§6):
 - `POST /api/v1/ingestion/full`: complete asynchronous ingestion (202)
 - `GET /api/v1/jobs/{id}`: ingestion job status
 
-## Analysis runs (E6, layers A and B)
+## Analysis runs (E6, layers A, B and C, restitution)
 
 The dashboard launches a run with the Supabase function `create_run`, which
 freezes the corpus and queues the run. The worker process also consumes that
 queue (`app/modules/runs`): it reads the frozen inputs (`run_inputs`), computes
 intermediate variables, corpus confidence and layer A scores in pure Python
-(`domain.py`), computes layer B (below), then writes everything in one
-transaction (`complete_run`). Layer C is not computed yet: its step is marked
-`skipped`.
+(`domain.py`), computes layer B, layer C and the restitution (below), then
+writes everything in one transaction (`complete_run`).
 
 Layer B (`layer_b.py`, `grader.py`) rates each retained criterion 0-3. Each
 active sub-question is embedded with the segment model and matched against the
@@ -86,6 +85,18 @@ truncated excerpts (`RUN_LAYER_B_EXCERPTS_PER_QUESTION`,
 question's own excerpts. When AI is disabled or fails, no rating is produced:
 criteria stay `non_conclu` and the run still completes. AI usage (model,
 tokens, cost, errors) is stored in `rules_applied.engine.layer_b.ai`.
+
+Layer C (`layer_c.py`) compares layer A scores with layer B ratings using
+deterministic rules (ALERT-01 to 06), then has every gap qualified in a single
+`detect_incoherence` call. Without AI, gaps are published with their rule's
+default severity and message (`qualified = false`).
+
+The restitution (`restitution.py`) selects up to three progress points,
+weaknesses and areas to verify, plus the action origins, with deterministic
+rules; a single `formulate_restitution` call writes the findings, a cautious
+conclusion and each action worded for the three personas. Without AI, findings
+keep a factual label, with no conclusion and no action plan. AI usage is
+stored in `rules_applied.engine.restitution.ai`.
 
 Variable scoring is deterministic: 1 (`present`) when strong detections
 (similarity ≥ `RUN_STRONG_SIMILARITY`, default 0.55) come from at least the

@@ -5,7 +5,8 @@ Tourne dans le processus du worker d'ingestion, avec son modèle
 d'embeddings (recherche des extraits de la couche B). Un échec passe le run
 en `failed` sans rien publier (RG-6.1) ; une IA indisponible n'est pas un
 échec : les critères de la couche B restent non conclus, les écarts de la
-couche C gardent leur qualification par défaut.
+couche C gardent leur qualification par défaut, la synthèse ses libellés
+factuels, sans conclusion ni plan d'action.
 """
 
 import asyncio
@@ -28,6 +29,7 @@ from app.modules.runs.grader import (
     AiUsage,
     AlertQualifier,
     GradingUnavailable,
+    RestitutionWriter,
     SubQuestionGrader,
 )
 from app.modules.runs.layer_b import (
@@ -45,6 +47,7 @@ from app.modules.runs.layer_b import (
 )
 from app.modules.runs.layer_c import (
     LAYER_C_VERSION,
+    LayerCInputs,
     LayerCResults,
     LayerCRules,
     detect,
@@ -55,11 +58,23 @@ from app.modules.runs.layer_c import PROMPT_VERSION as ALERT_PROMPT_VERSION
 from app.modules.runs.layer_c import build_batches as build_alert_batches
 from app.modules.runs.layer_c import interpret as interpret_alerts
 from app.modules.runs.repository import ClaimedRun, RunRepository
+from app.modules.runs.restitution import PROMPT_CODE as RESTITUTION_PROMPT_CODE
+from app.modules.runs.restitution import PROMPT_VERSION as RESTITUTION_PROMPT_VERSION
+from app.modules.runs.restitution import (
+    RESTITUTION_VERSION,
+    Restitution,
+    RestitutionRules,
+    select,
+)
+from app.modules.runs.restitution import build_batch as build_restitution_batch
+from app.modules.runs.restitution import interpret as interpret_restitution
 
 logger = logging.getLogger(__name__)
 
 NOT_AVAILABLE = {"reason": "not_available"}
-RUN_ENGINE_VERSION = f"{ENGINE_VERSION}+{LAYER_B_VERSION}+{LAYER_C_VERSION}"
+RUN_ENGINE_VERSION = (
+    f"{ENGINE_VERSION}+{LAYER_B_VERSION}+{LAYER_C_VERSION}+{RESTITUTION_VERSION}"
+)
 
 
 class RunFailure(Exception):
@@ -79,17 +94,19 @@ class RunWorker:
         embedder: Embedder | None = None,
         grader: SubQuestionGrader | None = None,
         qualifier: AlertQualifier | None = None,
+        writer: RestitutionWriter | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
         self._worker_id = f"{worker_id}#runs"
         self._stopping = asyncio.Event()
         # Sans modèle d'embeddings, la couche B n'est pas calculée ; sans
-        # IA, ses critères restent non conclus et les écarts de la couche C
-        # ne sont pas qualifiés.
+        # IA, ses critères restent non conclus, les écarts de la couche C ne
+        # sont pas qualifiés et la synthèse n'est pas rédigée.
         self._embedder = embedder
         self._grader = grader
         self._qualifier = qualifier
+        self._writer = writer
 
     def stop(self) -> None:
         self._stopping.set()
@@ -187,8 +204,11 @@ class RunWorker:
 
             step = "layer_c"
             await self._repository.step(run, step, "running")
+            layer_c_inputs = await self._repository.layer_c_inputs(run)
             layer_c_rules = LayerCRules()
-            layer_c = await self._layer_c(run, results, layer_b, layer_c_rules)
+            layer_c = await self._layer_c(
+                run, layer_c_inputs, results, layer_b, layer_c_rules
+            )
             await self._repository.step(run, step, "completed", layer_c.summary())
             payload["layer_c"] = layer_c.payload()
             payload["rules"] = {
@@ -198,14 +218,27 @@ class RunWorker:
 
             step = "restitution"
             await self._repository.step(run, step, "running")
+            restitution_rules = RestitutionRules()
+            restitution = await self._restitution(
+                run, layer_c_inputs, results, layer_b, layer_c, restitution_rules
+            )
+            payload["restitution"] = restitution.payload()
+            payload["summary"] = restitution.summary()
+            payload["rules"] = {
+                **payload["rules"],
+                "restitution": {**restitution_rules.as_dict(), "ai": restitution.ai},
+            }
             written = await self._repository.complete(run, payload)
             logger.info(
-                "Run %s completed: %s variables, %s evidences, %s scores, %s alerts",
+                "Run %s completed: %s variables, %s evidences, %s scores, %s alerts, "
+                "%s synthesis items, %s actions",
                 run.run_id,
                 written.get("variables"),
                 written.get("evidences"),
                 written.get("scores"),
                 written.get("alerts"),
+                written.get("synthesis_items"),
+                written.get("actions"),
             )
         except asyncio.CancelledError:
             raise
@@ -306,11 +339,11 @@ class RunWorker:
     async def _layer_c(
         self,
         run: ClaimedRun,
+        inputs: LayerCInputs,
         layer_a: LayerAResults,
         layer_b: LayerBResults | None,
         rules: LayerCRules,
     ) -> LayerCResults:
-        inputs = await self._repository.layer_c_inputs(run)
         alerts = detect(inputs, layer_a, layer_b, rules)
         ai: dict = {
             "prompt": f"{ALERT_PROMPT_CODE}_{ALERT_PROMPT_VERSION}",
@@ -377,6 +410,71 @@ class RunWorker:
             len(alerts),
             self._usage(ai, usages, len(batches)),
         )
+
+    async def _restitution(
+        self,
+        run: ClaimedRun,
+        inputs: LayerCInputs,
+        layer_a: LayerAResults,
+        layer_b: LayerBResults | None,
+        layer_c: LayerCResults,
+        rules: RestitutionRules,
+    ) -> Restitution:
+        restitution = select(inputs, layer_a, layer_b, layer_c.alerts, rules)
+        ai: dict = {
+            "prompt": f"{RESTITUTION_PROMPT_CODE}_{RESTITUTION_PROMPT_VERSION}",
+            "batches": 0,
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_eur": "0",
+            "errors": [],
+        }
+        if not restitution.findings:
+            restitution.ai = {**ai, "status": "not_needed"}
+            return restitution
+        if self._writer is None:
+            restitution.ai = {**ai, "status": "unavailable", "errors": ["AI_DISABLED"]}
+            return restitution
+        prompt = await self._prompt(
+            run, RESTITUTION_PROMPT_CODE, RESTITUTION_PROMPT_VERSION
+        )
+        if prompt is None:
+            restitution.ai = {
+                **ai,
+                "status": "unavailable",
+                "errors": ["PROMPT_UNAVAILABLE"],
+            }
+            return restitution
+
+        texts = known_texts(layer_b)
+        missing = list(
+            dict.fromkeys(
+                segment
+                for finding in restitution.findings
+                for segment in finding.segment_ids
+                if segment not in texts
+            )
+        )
+        texts.update(await self._repository.segment_texts(run, missing))
+        batch = build_restitution_batch(inputs.locale, restitution, texts, rules)
+        assert batch is not None
+        usages: list[AiUsage] = []
+        try:
+            raw, usage = await self._writer.write(prompt, batch)
+        except GradingUnavailable as error:
+            logger.warning(
+                "Run %s: restitution writing unavailable (%s: %s)",
+                run.run_id,
+                error.code,
+                error.message,
+            )
+            ai["errors"].append(error.code)
+        else:
+            usages.append(usage)
+            interpret_restitution(restitution, batch, raw)
+        restitution.ai = self._usage(ai, usages, 1)
+        return restitution
 
     async def _prompt(self, run: ClaimedRun, code: str, version: str) -> dict | None:
         """Prompt actif, ou `None` s'il est introuvable : l'étape continue
