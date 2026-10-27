@@ -47,11 +47,14 @@ from app.modules.runs.domain import LayerAResults, PillarScore
 from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.layer_c import Alert, LayerCInputs, ordered_segments
 
-RESTITUTION_VERSION = "restitution/1.0.0"
+RESTITUTION_VERSION = "restitution/1.1.0"
 PROMPT_CODE = "formulate_restitution"
 PROMPT_VERSION = "v1.0"
 
 Section = Literal["progres", "faiblesse", "a_verifier"]
+# Rédaction de la synthèse : faite, inutile (aucun constat), IA désactivée,
+# ou en échec (prompt introuvable, erreur, réponse inexploitable).
+Status = Literal["completed", "not_needed", "disabled", "failed"]
 OriginType = Literal["pillar", "criterion", "alert"]
 PERSONAS = ("decideur", "pmu", "analyste")
 # Clés courtes des personas dans la réponse de l'IA.
@@ -76,8 +79,10 @@ BECAUSE = re.compile(
 @dataclass(frozen=True, slots=True)
 class RestitutionRules:
     items_per_section: int = 3
-    weak_score: float = 50
-    weak_note: float = 1
+    # Faiblesses relatives (§8.4) : les plus faibles sous 80 % du maximum,
+    # soit sous « excellent » (couche A) et sous 2,4/3 (couche B).
+    weak_score: float = 80
+    weak_note: float = 2.4
     poor_confidence: float = 0.5
     limits_from: int = 2
     evidences_per_item: int = 3
@@ -189,6 +194,16 @@ class Restitution:
     qualified: bool = False
     ai: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def status(self) -> Status:
+        if self.qualified:
+            return "completed"
+        if self.ai.get("status") == "not_needed":
+            return "not_needed"
+        if "AI_DISABLED" in self.ai.get("errors", ()):
+            return "disabled"
+        return "failed"
+
     def items(self, section: Section) -> list[Finding]:
         return [finding for finding in self.findings if finding.section == section]
 
@@ -206,6 +221,7 @@ class Restitution:
             "actions": len(self.actions),
             "limits_lead": self.limits.leads,
             "qualified": self.qualified,
+            "status": self.status,
             "ai_status": self.ai.get("status"),
             "ai_calls": self.ai.get("calls", 0),
         }
@@ -230,6 +246,7 @@ class Restitution:
                 "conclusion": self.conclusion,
                 "limits": self.limits.as_dict(),
                 "qualified": self.qualified,
+                "status": self.status,
             },
             "items": [
                 {
@@ -455,7 +472,7 @@ def select(
         )
     notes = layer_b.notes if layer_b is not None else []
     for note in notes:
-        if note.status != "conclu" or note.note is None or note.note > rules.weak_note:
+        if note.status != "conclu" or note.note is None or note.note >= rules.weak_note:
             continue
         name = criterion_names.get(note.criterion_id)
         segments = criterion_segments(note.criterion_id)

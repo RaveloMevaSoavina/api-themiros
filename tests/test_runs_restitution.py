@@ -186,7 +186,7 @@ def test_weaknesses_put_major_alerts_first_then_the_weakest() -> None:
     alert = _alert()
     restitution = select(
         _inputs(),
-        _layer_a(_score(BUDGET, V2, 72), _score(SUIVI, V2, 20)),
+        _layer_a(_score(BUDGET, V2, 85), _score(SUIVI, V2, 20)),
         _layer_b(_note(PERTINENCE, 1.0)),
         [alert],
         RULES,
@@ -194,7 +194,7 @@ def test_weaknesses_put_major_alerts_first_then_the_weakest() -> None:
 
     first, second = restitution.items("faiblesse")
     # Pertinence porte une alerte majeure : elle passe avant le pilier
-    # pourtant plus faible ; Budget (72) n'est pas une faiblesse.
+    # pourtant plus faible ; Budget (85) n'est pas une faiblesse.
     assert (first.key, first.origin, first.criterion_id) == (
         "W1",
         "criterion",
@@ -205,6 +205,22 @@ def test_weaknesses_put_major_alerts_first_then_the_weakest() -> None:
     assert second.text == "Suivi-évaluation : 20/100 (confiance corpus 80 %)."
     (to_verify,) = restitution.items("a_verifier")
     assert to_verify.alert_id == alert.id and to_verify.text == alert.message
+
+
+def test_weaknesses_are_relative_below_eighty_percent() -> None:
+    restitution = select(
+        _inputs(),
+        _layer_a(_score(BUDGET, V2, 62.5), _score(SUIVI, V2, 80)),
+        _layer_b(_note(PERTINENCE, 1.8), _note(IMPACT, 2.4)),
+        [],
+        RULES,
+    )
+
+    # Un programme « bon » a quand même ses points les plus faibles ; un
+    # pilier à 80/100 ou un critère à 2,4/3 n'en sont pas.
+    assert [
+        (item.criterion_id or item.pillar_id) for item in restitution.items("faiblesse")
+    ] == [PERTINENCE, BUDGET]
 
 
 def test_at_most_three_items_per_section_major_alerts_first() -> None:
@@ -252,7 +268,7 @@ def test_the_synthesis_leads_with_the_corpus_limits() -> None:
 def test_criteria_not_concluded_are_action_origins_only() -> None:
     restitution = select(
         _inputs(),
-        _layer_a(_score(BUDGET, V2, 72)),
+        _layer_a(_score(BUDGET, V2, 85)),
         _layer_b(_note(IMPACT, None, documented=1)),
         [],
         RULES,
@@ -268,8 +284,8 @@ def _full_restitution():
     restitution = select(
         _inputs(),
         _layer_a(
-            _score(BUDGET, V1, 50),
-            _score(BUDGET, V2, 72, delta=22, label="renforce"),
+            _score(BUDGET, V1, 63),
+            _score(BUDGET, V2, 85, delta=22, label="renforce"),
             _score(SUIVI, V2, 20),
         ),
         _layer_b(_note(PERTINENCE, 1.0), _note(IMPACT, None)),
@@ -305,7 +321,7 @@ def test_every_candidate_goes_in_one_compact_ai_call() -> None:
 
 
 def test_nothing_to_write_means_no_ai_call() -> None:
-    restitution = select(_inputs(), _layer_a(_score(BUDGET, V2, 72)), None, [], RULES)
+    restitution = select(_inputs(), _layer_a(_score(BUDGET, V2, 85)), None, [], RULES)
 
     assert build_batch("fr", restitution, {}, RULES) is None
 

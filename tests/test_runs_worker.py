@@ -138,7 +138,7 @@ async def test_empty_queue_does_nothing() -> None:
     repository = FakeRepository([], _inputs())
     assert await _worker(repository).run_once() is False
     assert repository.claims == [
-        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0+restitution/1.0.0")
+        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0+restitution/1.1.0")
     ]
 
 
@@ -559,6 +559,7 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     ]
     assert restitution["items"][0]["text"] == "Constat W1."
     assert restitution["synthesis"]["qualified"] is True
+    assert restitution["synthesis"]["status"] == "completed"
     assert restitution["synthesis"]["conclusion"].startswith("Les résultats")
     assert [action["origin_type"] for action in restitution["actions"]] == [
         "criterion",
@@ -566,7 +567,7 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     ]
     assert all(len(action["projections"]) == 3 for action in restitution["actions"])
     rules = results["rules"]["restitution"]
-    assert rules["engine_version"] == "restitution/1.0.0"
+    assert rules["engine_version"] == "restitution/1.1.0"
     assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
     assert rules["ai"]["prompt"] == "formulate_restitution_v1.0"
     assert results["summary"]["actions"] == 2
@@ -585,6 +586,7 @@ async def test_without_ai_the_synthesis_keeps_factual_labels() -> None:
         "conclusion": None,
         "limits": restitution["synthesis"]["limits"],
         "qualified": False,
+        "status": "disabled",
     }
     assert restitution["actions"] == []
     ai = results["rules"]["restitution"]["ai"]
@@ -599,6 +601,7 @@ async def test_a_writing_failure_does_not_fail_the_run() -> None:
 
     (results,) = repository.completed
     assert results["restitution"]["synthesis"]["qualified"] is False
+    assert results["restitution"]["synthesis"]["status"] == "failed"
     assert results["restitution"]["actions"] == []
     assert results["rules"]["restitution"]["ai"]["errors"] == ["AI_OUTPUT_TRUNCATED"]
     assert repository.failures == []
@@ -613,4 +616,5 @@ async def test_an_empty_restitution_needs_no_ai_call() -> None:
     assert writer.batches == []
     (results,) = repository.completed
     assert results["restitution"]["items"] == []
+    assert results["restitution"]["synthesis"]["status"] == "not_needed"
     assert results["rules"]["restitution"]["ai"]["status"] == "not_needed"
