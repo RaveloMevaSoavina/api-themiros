@@ -65,6 +65,46 @@ class SupabaseGateway:
         )
         return self._json_rows(response)
 
+    async def rpc_value(
+        self,
+        function_name: str,
+        *,
+        token: str,
+        payload: dict,
+    ) -> Any:
+        """Appel RPC au nom de l'utilisateur, pour une fonction scalaire."""
+        response = await self._client.post(
+            self._rest_url(f"rpc/{function_name}"),
+            json=payload,
+            headers=self._user_headers(token),
+            timeout=10,
+        )
+        if response.status_code in {401, 403}:
+            raise ApiError(
+                status_code=response.status_code,
+                code="DATABASE_ACCESS_DENIED",
+                detail="Accès aux données du workspace refusé",
+            )
+        if not response.is_success:
+            raise self._service_error(response)
+        return response.json() if response.content else None
+
+    async def rest_insert(self, path: str, *, token: str, payload: dict) -> None:
+        """Insertion au nom de l'utilisateur : la RLS de la table s'applique."""
+        headers = self._user_headers(token)
+        headers["Prefer"] = "return=minimal"
+        response = await self._client.post(
+            self._rest_url(path), json=payload, headers=headers, timeout=10
+        )
+        if response.status_code in {401, 403}:
+            raise ApiError(
+                status_code=response.status_code,
+                code="DATABASE_ACCESS_DENIED",
+                detail="Accès aux données du workspace refusé",
+            )
+        if not response.is_success:
+            raise self._service_error(response)
+
     async def internal_rpc(
         self,
         function_name: str,

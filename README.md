@@ -110,6 +110,26 @@ The thresholds and `ENGINE_VERSION` are stored in each run's `rules_applied`.
 A run whose corpus classification is still pending is deferred
 (`RUN_DEFER_SECONDS`) for at most `RUN_CLASSIFICATION_WAIT_SECONDS`.
 
+## Run exports (E14)
+
+`POST /api/v1/exports/{run_id}/{pdf|docx|xlsx|csv}` (body:
+`{"locale": "fr"|"en", "persona": "decideur"|"pmu"|"analyste"}`) returns the
+report of a completed run as a file (`Content-Disposition` gives its name).
+Everything is read with the caller's token, so RLS decides what they can
+export. `app/modules/exports/report.py` builds one report shared by every
+format, in the order of the screens: corpus limits first (always, including
+unconcluded criteria, undocumented variables, missing layers, changed corpus
+and missing validation), then comparison, pillars (layer A), criteria
+(layer B), alerts (layer C), synthesis and the action plan for the requested
+persona. Evidence becomes numbered notes (document, page, excerpt). An
+exploratory run carries a warning banner on the first page.
+
+Unlike the API catalogue (§9), the file is generated during the request
+rather than queued and polled, so there is no `exports` table or storage.
+Each export is recorded in `audit_events` (`report_exported`, or
+`report_export_failed`) with its format, run, author and timestamp; an
+export that cannot be recorded fails.
+
 ## Tests and quality
 
 ```bash
