@@ -118,10 +118,12 @@ class IngestionPipeline:
         profile, financier_terms = await self._repository.load_profile(job.workspace_id)
         rules = await self._repository.load_rules(job.workspace_id)
         result: dict[str, Any] = {"kind": job.kind}
+        detected_language: Detection | None = None
 
         if job.kind in {"full", "extract"}:
             extraction = await self.extract(job, document, profile, rules, on_stage)
             stored = extraction.stored
+            detected_language = extraction.language
             result["extraction"] = {
                 "pdf_type": extraction.document.pdf_type,
                 "total_pages": stored.total_pages,
@@ -135,7 +137,14 @@ class IngestionPipeline:
 
         if job.kind in {"full", "requalify", "qualify"}:
             qualification = await self.qualify(
-                job, profile, financier_terms, rules, stored, on_stage, indexed
+                job,
+                profile,
+                financier_terms,
+                rules,
+                stored,
+                on_stage,
+                indexed,
+                detected_language=detected_language,
             )
             result["qualification"] = {
                 "status": qualification.status,
@@ -258,17 +267,21 @@ class IngestionPipeline:
         stored: StoredPages,
         on_stage: StageCallback,
         known_vectors: Mapping[str, list[float]] | None = None,
+        detected_language: Detection | None = None,
     ) -> QualificationOutcome:
+        """`detected_language` : langue déjà détectée à l'extraction, sur le
+        même texte."""
         await on_stage("detection")
         text = "\n\n".join(page.text for page in stored.pages)
         overrides = await self._repository.load_overrides(job.document_id)
-        language = (
-            Detection(overrides["language"], 1.0, "user")
-            if "language" in overrides
-            else await asyncio.to_thread(
+        if "language" in overrides:
+            language = Detection(overrides["language"], 1.0, "user")
+        elif detected_language is not None:
+            language = detected_language
+        else:
+            language = await asyncio.to_thread(
                 detect_language, text, rules.language_confidence_threshold
             )
-        )
         country = (
             Detection(overrides["country"].upper(), 1.0, "user")
             if "country" in overrides

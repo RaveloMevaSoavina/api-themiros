@@ -6,6 +6,7 @@ caractères.
 """
 
 from collections import Counter
+from collections.abc import Sequence
 
 from langdetect import DetectorFactory, LangDetectException, detect_langs
 
@@ -16,6 +17,9 @@ DetectorFactory.seed = 0
 SAMPLE_CHARS = 10_000
 WINDOW_CHARS = 5_000
 MIN_SAMPLE_CHARS = 20
+# Au-delà, les fenêtres du vote sont réparties dans tout le document : le
+# coût ne croît plus avec sa taille (~7 s pour 2 millions de caractères).
+MAX_WINDOWS = 20
 
 
 def _predict(sample: str) -> tuple[str, float] | None:
@@ -30,15 +34,18 @@ def _predict(sample: str) -> tuple[str, float] | None:
 
 def detect_language(text: str, confidence_threshold: float = 0.7) -> Detection:
     """Algorithme de la spec §5.3 : un échantillon de 10 000 caractères, puis
-    un vote sur des fenêtres de 5 000 caractères si la confiance est faible."""
+    un vote sur des fenêtres de 5 000 caractères si la confiance est faible
+    (`MAX_WINDOWS` au plus)."""
     first = _predict(text[:SAMPLE_CHARS])
     if first and first[1] >= confidence_threshold:
         return Detection(first[0], round(first[1], 4))
 
-    windows = [
-        text[start : start + WINDOW_CHARS]
-        for start in range(0, len(text), WINDOW_CHARS)
-    ]
+    starts: Sequence[int] = range(0, len(text), WINDOW_CHARS)
+    if len(starts) > MAX_WINDOWS:
+        starts = [
+            starts[index * len(starts) // MAX_WINDOWS] for index in range(MAX_WINDOWS)
+        ]
+    windows = [text[start : start + WINDOW_CHARS] for start in starts]
     votes = [prediction[0] for window in windows if (prediction := _predict(window))]
     if not votes:
         if first:

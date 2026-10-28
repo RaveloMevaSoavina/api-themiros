@@ -6,7 +6,7 @@ par l'OCR Tesseract page par page, en parallèle.
 
 import logging
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -115,18 +115,14 @@ def extract_document(
     return _with_offsets(extracted)
 
 
-def detect_pdf_type(document: pymupdf.Document) -> PdfType:
-    """Algorithme de la spec §4.2."""
-    text_chars = 0
-    image_pages = 0
-    for page in document:
-        text = page.get_text("text").strip()
-        text_chars += len(text)
-        if len(text) < SCANNED_PAGE_MAX_CHARS and page.get_images():
-            image_pages += 1
-    if text_chars < SCANNED_PAGE_MAX_CHARS * max(1, len(document)):
+def detect_pdf_type(texts: Sequence[str], has_images: Sequence[bool]) -> PdfType:
+    """Algorithme de la spec §4.2, sur le texte natif de chaque page."""
+    if sum(len(text) for text in texts) < SCANNED_PAGE_MAX_CHARS * max(1, len(texts)):
         return "scan"
-    if image_pages:
+    if any(
+        len(text) < SCANNED_PAGE_MAX_CHARS and images
+        for text, images in zip(texts, has_images, strict=True)
+    ):
         return "mixte"
     return "natif"
 
@@ -136,20 +132,27 @@ def _extract_pdf(content: bytes, ocr: OcrOptions) -> ExtractedDocument:
     try:
         if document.needs_pass:
             raise password_protected()
-        pdf_type = detect_pdf_type(document)
+        # Une seule lecture du texte natif : il sert au type du PDF et au
+        # contenu des pages.
+        natives: list[str] = []
+        has_images: list[bool] = []
         pages: list[ExtractedPage] = []
-        to_ocr: list[int] = []
         for index, page in enumerate(document):
             text = page.get_text("text", sort=True).strip()
-            tables = _pdf_tables(page)
+            natives.append(text)
+            has_images.append(bool(page.get_images()))
+            # Un tableau sans texte natif n'a que des cellules vides.
+            tables = _pdf_tables(page) if text else ""
             if tables:
                 text = f"{text}\n\n{tables}".strip()
-            needs_ocr = len(text) < SCANNED_PAGE_MAX_CHARS and (
-                bool(page.get_images()) or pdf_type == "scan"
-            )
-            if needs_ocr:
-                to_ocr.append(index)
             pages.append(ExtractedPage(page_number=index + 1, text=text))
+        pdf_type = detect_pdf_type(natives, has_images)
+        to_ocr = [
+            index
+            for index, page in enumerate(pages)
+            if len(page.text) < SCANNED_PAGE_MAX_CHARS
+            and (has_images[index] or pdf_type == "scan")
+        ]
 
         if to_ocr:
             # PyMuPDF n'est pas thread-safe : le rendu est séquentiel, l'OCR
@@ -170,6 +173,11 @@ def _extract_pdf(content: bytes, ocr: OcrOptions) -> ExtractedDocument:
 
 
 def _pdf_tables(page: pymupdf.Page) -> str:
+    # La stratégie par défaut (« lines ») ne trouve un tableau que dans les
+    # tracés vectoriels : sans tracé, `find_tables` (~45 ms par page) est
+    # évité.
+    if not page.get_cdrawings():
+        return ""
     try:
         found = page.find_tables()
     except Exception:  # noqa: BLE001 — une page sans structure exploitable

@@ -10,6 +10,7 @@ from app.core.errors import ApiError
 from app.modules.ingestion.extraction import (
     OcrOptions,
     detect_format,
+    detect_pdf_type,
     extract_document,
 )
 
@@ -53,6 +54,46 @@ def test_native_pdf_keeps_text_per_page_with_offsets() -> None:
     assert not extracted.pages[0].is_ocr
     assert extracted.pages[1].char_start == len(extracted.pages[0].text) + 2
     assert extracted.exploitable_pages(100) == 2
+
+
+def _table_page(document: pymupdf.Document, rows: list[tuple[str, str]]) -> None:
+    """Un paragraphe suivi d'un tableau tracé (filets vectoriels)."""
+    page = document.new_page()
+    page.insert_textbox(pymupdf.Rect(50, 50, 550, 300), PARAGRAPH, fontsize=11)
+    top, height, columns = 320, 24, (50, 300, 550)
+    for index in range(len(rows) + 1):
+        y = top + index * height
+        page.draw_line((columns[0], y), (columns[-1], y))
+    for x in columns:
+        page.draw_line((x, top), (x, top + len(rows) * height))
+    for index, row in enumerate(rows):
+        for x, value in zip(columns, row, strict=False):
+            page.insert_text((x + 5, top + index * height + 16), value, fontsize=10)
+
+
+def test_pdf_tables_are_only_searched_on_pages_with_drawings(monkeypatch) -> None:
+    document = pymupdf.open(stream=_pdf([PARAGRAPH * 2]), filetype="pdf")
+    _table_page(document, [("Activite", "Budget"), ("Irrigation", "120 000")])
+    calls: list[int] = []
+    find_tables = pymupdf.Page.find_tables
+
+    def counting(page, *args, **kwargs):
+        calls.append(page.number)
+        return find_tables(page, *args, **kwargs)
+
+    monkeypatch.setattr(pymupdf.Page, "find_tables", counting)
+    extracted = extract_document(document.tobytes(), "budget.pdf")
+
+    assert calls == [1]
+    assert "Irrigation | 120 000" in extracted.pages[1].text
+
+
+def test_pdf_type_follows_native_text_and_images() -> None:
+    text = "x" * 300
+    assert detect_pdf_type([text, text], [False, True]) == "natif"
+    assert detect_pdf_type([text, ""], [False, True]) == "mixte"
+    assert detect_pdf_type(["", "court"], [True, True]) == "scan"
+    assert detect_pdf_type([], []) == "scan"
 
 
 def test_empty_pages_are_not_exploitable() -> None:

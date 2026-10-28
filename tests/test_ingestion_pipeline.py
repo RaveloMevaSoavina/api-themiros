@@ -7,6 +7,7 @@ import pymupdf
 
 from app.core.config import Settings
 from app.core.errors import ApiError
+from app.modules.ingestion import pipeline as pipeline_module
 from app.modules.ingestion.analysis.country import CountryDetector
 from app.modules.ingestion.analysis.segmenter import PageText
 from app.modules.ingestion.domain import IngestionRules, WorkspaceProfile
@@ -230,6 +231,28 @@ async def test_full_ingestion_of_a_relevant_document_indexes_it() -> None:
     assert repository.segments[0]["embedding"] == [1.0, 0.0]
     assert repository.completed is not None
     assert repository.completed["indexation"]["segments_count"] == repository.published
+
+
+async def test_full_ingestion_detects_the_language_once(monkeypatch) -> None:
+    calls: list[str] = []
+    detect = pipeline_module.detect_language
+
+    def counting(text, threshold):
+        calls.append(text)
+        return detect(text, threshold)
+
+    monkeypatch.setattr(pipeline_module, "detect_language", counting)
+    repository = FakeRepository(_pdf(RELEVANT))
+    pipeline = _pipeline(repository)
+    await _worker(repository, pipeline).process(repository.job())
+
+    assert len(calls) == 1
+    assert repository.qualification is not None
+    assert repository.qualification["language"] == "fr"
+
+    # Requalification : le texte conservé est relu, la langue redétectée.
+    await _worker(repository, pipeline).process(repository.job("requalify"))
+    assert len(calls) == 2
 
 
 async def test_off_topic_document_is_rejected_and_never_indexed() -> None:

@@ -1,6 +1,7 @@
+from app.modules.ingestion.analysis import language
 from app.modules.ingestion.analysis.country import CountryDetector
 from app.modules.ingestion.analysis.embeddings import l2_normalize, semantic_score
-from app.modules.ingestion.analysis.language import detect_language
+from app.modules.ingestion.analysis.language import MAX_WINDOWS, detect_language
 from app.modules.ingestion.analysis.segmenter import (
     MAX_TOKENS,
     TARGET_TOKENS,
@@ -31,6 +32,23 @@ def test_detects_french_and_english() -> None:
 def test_language_votes_on_windows_for_mixed_documents() -> None:
     detection = detect_language(FRENCH * 3 + ENGLISH)
     assert detection.value == "fr"
+
+
+def test_language_vote_is_bounded_on_long_documents(monkeypatch) -> None:
+    calls: list[str] = []
+    predict = language._predict
+
+    def counting(sample: str):
+        calls.append(sample)
+        return predict(sample)
+
+    monkeypatch.setattr(language, "_predict", counting)
+    # ~600 fenêtres de 5 000 caractères, majoritairement en français.
+    detection = detect_language((FRENCH * 3 + ENGLISH) * 300, 1.01)
+
+    assert detection.value == "fr"
+    # Échantillon initial, puis le vote.
+    assert len(calls) == 1 + MAX_WINDOWS
 
 
 def test_language_unknown_for_empty_text() -> None:
