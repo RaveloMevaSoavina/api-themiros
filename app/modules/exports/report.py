@@ -11,9 +11,10 @@ couches non calculées, corpus modifié, absence de validation. Aucun format
 ne peut produire un rapport « propre » qui les masque. Un run exploratoire
 porte son bandeau en tête.
 
-Les preuves deviennent des notes numérotées (document, page, extrait), dans
-l'ordre de leur première citation (US-22.4) ; chaque élément renvoie à ses
-numéros.
+Les preuves deviennent des notes numérotées, une par document et par page
+(US-22.4), dans l'ordre de leur première citation ; chaque élément renvoie à
+ses numéros, regroupés en plages. Une note cite les extraits les plus
+proches de ce qu'ils étayent (similarité), deux au plus.
 
 Fonctions pures : aucune dépendance au stockage ni au réseau.
 """
@@ -25,6 +26,7 @@ from typing import Any
 from app.modules.exports.labels import labels_for
 
 EXCERPT_CHARS = 400
+EXCERPTS_PER_NOTE = 2
 Persona = str
 
 
@@ -47,12 +49,24 @@ class RunRows:
 
 @dataclass(frozen=True, slots=True)
 class Note:
+    """Une page d'un document, citée par un ou plusieurs éléments."""
+
     number: int
     document: str | None
     page: int | None
     section: str | None
-    excerpt: str
-    subject: str
+    excerpts: list[str]
+    subjects: list[str]
+    #: Extraits de cette page retenus par le moteur, cités ou non.
+    extracts: int
+
+    @property
+    def excerpt(self) -> str:
+        return "\n".join(self.excerpts)
+
+    @property
+    def subject(self) -> str:
+        return " ; ".join(self.subjects)
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +225,27 @@ class Report:
         return moment.strftime(f"{pattern} %H:%M UTC" if time else pattern)
 
     def refs(self, numbers: list[int]) -> str:
-        return " ".join(f"[{number}]" for number in numbers)
+        """Numéros de notes, les suites regroupées : [3] [7–12] [15]."""
+        runs: list[list[int]] = []
+        for number in sorted(set(numbers)):
+            if runs and number == runs[-1][-1] + 1:
+                runs[-1].append(number)
+            else:
+                runs.append([number])
+        return " ".join(
+            f"[{run[0]}–{run[-1]}]"
+            if len(run) > 2
+            else " ".join(f"[{number}]" for number in run)
+            for run in runs
+        )
+
+    def omitted(self, note: Note) -> str | None:
+        """Mention des extraits non cités, quand la note en écarte."""
+        if note.extracts <= len(note.excerpts):
+            return None
+        return self.labels["extracts"].format(
+            shown=len(note.excerpts), count=note.extracts
+        )
 
     def labeled(self, name: str, value: object) -> str:
         separator = " : " if self.locale == "fr" else ": "
@@ -286,39 +320,86 @@ def localized(row: dict[str, Any], locale: str, translations: str) -> dict[str, 
     return row
 
 
+@dataclass(slots=True)
+class _Page:
+    number: int
+    first: dict[str, Any]
+    rows: list[dict[str, Any]]
+    subjects: list[str]
+
+
 class _Citations:
-    """Numérote les preuves dans l'ordre de leur première citation."""
+    """Numérote les pages citées dans l'ordre de leur première citation."""
 
     def __init__(self, evidences: dict[str, dict[str, Any]], subject) -> None:
         self._evidences = evidences
         self._subject = subject
-        self._numbers: dict[str, int] = {}
-        self.notes: list[Note] = []
+        self._pages: dict[tuple[str, Any], _Page] = {}
+
+    @staticmethod
+    def _key(row: dict[str, Any]) -> tuple[str, Any]:
+        # Sans document (supprimé depuis le run), l'extrait reste seul.
+        if not row.get("document_id"):
+            return ("evidence", row["id"])
+        return (row["document_id"], row.get("page_number"))
 
     def cite(self, evidence_ids: list[str]) -> list[int]:
-        numbers: list[int] = []
+        numbers: set[int] = set()
         for evidence_id in evidence_ids:
             row = self._evidences.get(evidence_id)
             if row is None:
                 continue
-            if evidence_id not in self._numbers:
-                number = len(self.notes) + 1
-                self._numbers[evidence_id] = number
+            key = self._key(row)
+            page = self._pages.get(key)
+            if page is None:
+                page = _Page(len(self._pages) + 1, row, [], [])
+                self._pages[key] = page
+            if all(item["id"] != row["id"] for item in page.rows):
+                page.rows.append(row)
+            subject = self._subject(row)
+            if subject not in page.subjects:
+                page.subjects.append(subject)
+            numbers.add(page.number)
+        return sorted(numbers)
+
+    @property
+    def notes(self) -> list[Note]:
+        notes = []
+        for page in self._pages.values():
+            ranked = sorted(
+                page.rows,
+                key=lambda row: -float(row.get("similarity") or 0),
+            )
+            excerpts: list[str] = []
+            for row in ranked:
                 excerpt = " ".join(str(row.get("excerpt") or "").split())
                 if len(excerpt) > EXCERPT_CHARS:
                     excerpt = excerpt[: EXCERPT_CHARS - 1].rstrip() + "…"
-                self.notes.append(
-                    Note(
-                        number=number,
-                        document=(row.get("documents") or {}).get("original_filename"),
-                        page=row.get("page_number"),
-                        section=row.get("section_title"),
-                        excerpt=excerpt,
-                        subject=self._subject(row),
-                    )
+                if excerpt and excerpt not in excerpts:
+                    excerpts.append(excerpt)
+                if len(excerpts) == EXCERPTS_PER_NOTE:
+                    break
+            notes.append(
+                Note(
+                    number=page.number,
+                    document=(page.first.get("documents") or {}).get(
+                        "original_filename"
+                    ),
+                    page=page.first.get("page_number"),
+                    section=next(
+                        (
+                            row["section_title"]
+                            for row in page.rows
+                            if row.get("section_title")
+                        ),
+                        None,
+                    ),
+                    excerpts=excerpts,
+                    subjects=page.subjects,
+                    extracts=len(page.rows),
                 )
-            numbers.append(self._numbers[evidence_id])
-        return sorted(set(numbers))
+            )
+        return notes
 
 
 def _number(value: Any) -> float | None:

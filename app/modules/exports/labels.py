@@ -232,8 +232,8 @@ LABELS: dict[str, dict[str, Any]] = {
         "no_notes": "Aucune preuve n'est citée dans ce rapport.",
         "no_limits": "Aucune autre limite relevée.",
         "notes_intro": (
-            "Preuves du run du {date} (moteur {engine}). Les numéros entre "
-            "crochets renvoient à ces notes."
+            "Preuves du run du {date} (moteur {engine}), une note par page "
+            "citée. Les numéros entre crochets renvoient à ces notes."
         ),
         "average": "Score moyen des piliers",
         "not_computed": "Non calculé",
@@ -242,6 +242,7 @@ LABELS: dict[str, dict[str, Any]] = {
         "empty": "—",
         "page": "p. {page}",
         "page_footer": "Page {page}/{total}",
+        "extracts": "{shown} extraits cités sur les {count} de cette page.",
     },
     "en": {
         "title": "Evaluation report",
@@ -463,8 +464,8 @@ LABELS: dict[str, dict[str, Any]] = {
         "no_notes": "No evidence is cited in this report.",
         "no_limits": "No other limit identified.",
         "notes_intro": (
-            "Evidence from the run of {date} (engine {engine}). Numbers in "
-            "brackets refer to these notes."
+            "Evidence from the run of {date} (engine {engine}), one note per "
+            "cited page. Numbers in brackets refer to these notes."
         ),
         "average": "Average pillar score",
         "not_computed": "Not computed",
@@ -473,6 +474,7 @@ LABELS: dict[str, dict[str, Any]] = {
         "empty": "—",
         "page": "p. {page}",
         "page_footer": "Page {page}/{total}",
+        "extracts": "{shown} of the {count} excerpts from this page are quoted.",
     },
 }
 

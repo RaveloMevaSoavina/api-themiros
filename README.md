@@ -121,8 +121,10 @@ format, in the order of the screens: corpus limits first (always, including
 unconcluded criteria, undocumented variables, missing layers, changed corpus
 and missing validation), then comparison, pillars (layer A), criteria
 (layer B), alerts (layer C), synthesis and the action plan for the requested
-persona. Evidence becomes numbered notes (document, page, excerpt). An
-exploratory run carries a warning banner on the first page.
+persona. Evidence becomes numbered notes, one per cited document page,
+quoting at most the two excerpts with the highest similarity and stating how
+many were left out; consecutive note numbers are shown as ranges
+(`[131–140]`). An exploratory run carries a warning banner on the first page.
 
 Unlike the API catalogue (§9), the file is generated during the request
 rather than queued and polled, so there is no `exports` table or storage.

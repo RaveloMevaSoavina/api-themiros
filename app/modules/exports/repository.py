@@ -91,7 +91,8 @@ class ExportRepository:
             select(
                 "evidences",
                 "id,document_id,page_number,section_title,excerpt,pillar_id,"
-                "criterion_id,variable_code,documents(original_filename)",
+                "criterion_id,variable_code,similarity,"
+                "documents(original_filename)",
                 order="created_at,id",
             ),
             select("syntheses", "conclusion,limits,status"),

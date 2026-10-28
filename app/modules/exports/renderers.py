@@ -277,12 +277,16 @@ def _html(report: Report) -> str:
     html.append(f"<p class='muted'>{_e(report.notes_intro)}</p>")
     if not report.notes:
         html.append(f"<p>{_e(t['no_notes'])}</p>")
-    html.extend(
-        f"<p><b>[{note.number}]</b> {_e(_source(report, note))}"
-        f"<br/><span class='muted'>{_e(note.subject)}</span>"
-        f"<br/>{_e(report.quote(note.excerpt))}</p>"
-        for note in report.notes
-    )
+    for note in report.notes:
+        lines = [
+            f"<b>[{note.number}]</b> {_e(_source(report, note))}",
+            f"<span class='muted'>{_e(note.subject)}</span>",
+            *(_e(report.quote(excerpt)) for excerpt in note.excerpts),
+        ]
+        omitted = report.omitted(note)
+        if omitted:
+            lines.append(f"<span class='muted'>{_e(omitted)}</span>")
+        html.append(f"<p>{'<br/>'.join(lines)}</p>")
     return "".join(html)
 
 
@@ -601,7 +605,13 @@ def render_docx(report: Report) -> bytes:
         subject = paragraph.add_run(f"\n{note.subject}")
         subject.font.size = Pt(8.5)
         subject.font.color.rgb = RGBColor.from_string(MUTED)
-        paragraph.add_run(f"\n{report.quote(note.excerpt)}").font.size = Pt(9)
+        for excerpt in note.excerpts:
+            paragraph.add_run(f"\n{report.quote(excerpt)}").font.size = Pt(9)
+        omitted = report.omitted(note)
+        if omitted:
+            run = paragraph.add_run(f"\n{omitted}")
+            run.font.size = Pt(8.5)
+            run.font.color.rgb = RGBColor.from_string(MUTED)
 
     buffer = io.BytesIO()
     document.save(buffer)

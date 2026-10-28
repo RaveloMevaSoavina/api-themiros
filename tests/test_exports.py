@@ -287,6 +287,60 @@ def test_evidences_become_numbered_notes_in_citation_order() -> None:
     assert built.notes[0].subject == "Gouvernance · Comité de pilotage"
 
 
+def page_evidence(index: int, **overrides) -> dict:
+    return {
+        "id": f"p{index}",
+        "document_id": "d1",
+        "page_number": 4,
+        "section_title": None,
+        "excerpt": f"Extrait {index}.",
+        "pillar_id": "p1",
+        "criterion_id": None,
+        "variable_code": "V1",
+        "similarity": f"0.{index}",
+        "documents": {"original_filename": "rapport-annuel.pdf"},
+        **overrides,
+    }
+
+
+def test_one_note_per_document_page_with_closest_excerpts() -> None:
+    built = report(
+        evidences=[
+            *(page_evidence(index) for index in range(1, 6)),
+            page_evidence(6, page_number=5),
+            page_evidence(7, document_id=None, documents=None),
+            page_evidence(8, criterion_id="c1", pillar_id=None, variable_code=None),
+        ],
+        alerts=[],
+        items=[],
+        actions=[],
+    )
+
+    assert [(note.document, note.page) for note in built.notes] == [
+        ("rapport-annuel.pdf", 4),
+        ("rapport-annuel.pdf", 5),
+        (None, 4),
+    ]
+    page = built.notes[0]
+    assert page.excerpts == ["Extrait 8.", "Extrait 5."]
+    assert page.extracts == 6
+    assert page.subjects == ["Gouvernance · Comité de pilotage", "Efficacité"]
+    assert built.omitted(page) == "2 extraits cités sur les 6 de cette page."
+    assert built.omitted(built.notes[1]) is None
+    assert built.pillars[0].variables[0].notes == [1, 2, 3]
+    assert built.criteria[1].notes == [1]
+
+
+def test_consecutive_note_numbers_become_ranges() -> None:
+    built = report()
+
+    assert built.refs([140, 131, 132, 133, 134, 135, 136, 137, 138, 139]) == (
+        "[131–140]"
+    )
+    assert built.refs([3, 7, 8, 9, 12, 13, 15]) == "[3] [7–9] [12] [13] [15]"
+    assert built.refs([]) == ""
+
+
 def test_report_follows_locale_and_persona() -> None:
     built = report(locale="en", persona="decideur")
 
