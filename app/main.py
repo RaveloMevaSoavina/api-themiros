@@ -34,8 +34,13 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
-        # Nom du fichier d'un export (E14), lu par le dashboard.
-        expose_headers=["Content-Disposition"],
+        # Nom du fichier d'un export (E14) et page d'une preuve surlignée,
+        # lus par le dashboard.
+        expose_headers=[
+            "Content-Disposition",
+            "X-Evidence-Page",
+            "X-Evidence-Highlighted",
+        ],
     )
     install_middleware(app)
     install_error_handlers(app)
