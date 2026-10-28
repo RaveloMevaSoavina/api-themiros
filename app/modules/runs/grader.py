@@ -285,7 +285,7 @@ class OpenAIRestitutionWriter(OpenAIStructuredCall):
             LlmRestitutionOutput,
             batch.estimated_input_tokens,
             batch.max_output_tokens,
-            3000,
+            6000,
         )
         return (
             RawRestitution(

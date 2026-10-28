@@ -94,8 +94,10 @@ default severity and message (`qualified = false`).
 The restitution (`restitution.py`) selects up to three progress points,
 weaknesses and areas to verify, plus the action origins, with deterministic
 rules; weaknesses are relative (the weakest pillars below 80/100 and criteria
-below 2.4/3). A single `formulate_restitution` call writes the findings, a
-cautious conclusion and each action worded for the three personas. Without
+below 2.4/3). A single `formulate_restitution` call (prompt v1.1) writes the
+findings, a cautious narrative conclusion (two or three paragraphs) and each
+action worded for the three personas, in one or two full sentences with
+their reason. Without
 AI, findings keep a factual label, with no conclusion and no action plan; the
 synthesis `status` says why (`not_needed`, `disabled` or `failed`, otherwise
 `completed`). AI usage is stored in `rules_applied.engine.restitution.ai`.

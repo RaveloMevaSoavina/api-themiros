@@ -47,9 +47,9 @@ from app.modules.runs.domain import LayerAResults, PillarScore
 from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.layer_c import Alert, LayerCInputs, ordered_segments
 
-RESTITUTION_VERSION = "restitution/1.1.0"
+RESTITUTION_VERSION = "restitution/1.2.0"
 PROMPT_CODE = "formulate_restitution"
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v1.1"
 
 Section = Literal["progres", "faiblesse", "a_verifier"]
 # Rédaction de la synthèse : faite, inutile (aucun constat), IA désactivée,
@@ -64,11 +64,13 @@ PERSONA_KEYS = {"decideur": "dec", "pmu": "pmu", "analyste": "ana"}
 CHARS_PER_TOKEN = 3
 SYSTEM_PROMPT_TOKENS = 900
 OUTPUT_TOKENS_PER_ITEM = 70
-OUTPUT_TOKENS_PER_ACTION = 220
-OUTPUT_TOKENS_CONCLUSION = 200
+OUTPUT_TOKENS_PER_ACTION = 650
+OUTPUT_TOKENS_CONCLUSION = 650
 ITEM_CHARS = 240
-CONCLUSION_CHARS = 700
-PROJECTION_CHARS = 200
+# Le prompt (v1.1) demande 1 800 caractères pour la conclusion et 300 pour
+# une action ou sa raison : ces plafonds ne coupent qu'un dépassement net.
+CONCLUSION_CHARS = 2400
+PROJECTION_CHARS = 450
 
 # « Recommandée parce que » est ajouté à l'affichage.
 BECAUSE = re.compile(
@@ -647,6 +649,24 @@ def _reason(text: str) -> str:
     return truncate(BECAUSE.sub("", text, count=1), PROJECTION_CHARS)
 
 
+def _narrative(text: str, limit: int) -> str:
+    """Conclusion en paragraphes : espaces normalisés dans chacun, lignes
+    vides gardées entre eux, puis coupe au plafond comme `truncate`."""
+    paragraphs = [
+        " ".join(paragraph.split())
+        for paragraph in re.split(r"\n\s*\n", text)
+        if paragraph.strip()
+    ]
+    joined = "\n\n".join(paragraphs)
+    if len(joined) <= limit:
+        return joined
+    cut = joined[: limit - 1]
+    space = max(cut.rfind(" "), cut.rfind("\n"))
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip() + "…"
+
+
 def interpret(
     restitution: Restitution,
     batch: RestitutionBatch,
@@ -670,7 +690,7 @@ def interpret(
 
     conclusion = (raw.conclusion or "").strip()
     restitution.conclusion = (
-        truncate(conclusion, CONCLUSION_CHARS) if conclusion else None
+        _narrative(conclusion, CONCLUSION_CHARS) if conclusion else None
     )
 
     actions: dict[str, Action] = {}

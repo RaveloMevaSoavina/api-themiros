@@ -401,6 +401,45 @@ def test_the_ai_writes_items_conclusion_and_actions() -> None:
     assert second["pillar_id"] is None and len(second["projections"]) == 3
 
 
+def test_long_actions_and_a_narrative_conclusion_are_kept_whole() -> None:
+    restitution, batch, _ = _full_restitution()
+    action = "Documenter la mise en œuvre effective du volet. " * 6
+    reason = "les rapports décrivent le dispositif prévu, pas sa mise en œuvre. " * 4
+    paragraphs = [
+        f"Paragraphe {index}, {'phrase prudente ' * 30}." for index in (1, 2, 3)
+    ]
+    raw = RawRestitution(
+        items=(),
+        conclusion="\n\n".join(paragraphs).replace("\n\n", "\n \n", 1),
+        actions=(
+            RawAction(
+                "W1",
+                ("E3",),
+                {
+                    persona: RawProjection(action, reason)
+                    for persona in ("decideur", "pmu", "analyste")
+                },
+            ),
+        ),
+    )
+
+    interpret(restitution, batch, raw)
+
+    # Prompt v1.1 : une action et sa raison de 300 caractères ne sont plus
+    # coupées ; la conclusion garde ses paragraphes.
+    (written,) = restitution.actions
+    assert written.projections[0].text == action.strip()
+    assert written.projections[0].justification == reason.strip()
+    assert restitution.conclusion.split("\n\n") == [
+        " ".join(paragraph.split()) for paragraph in paragraphs
+    ]
+
+    raw = RawRestitution(items=(), conclusion="Mot " * 1000, actions=())
+    interpret(restitution, batch, raw)
+    assert len(restitution.conclusion) <= 2400
+    assert restitution.conclusion.endswith("…")
+
+
 def test_english_labels_follow_the_approach_locale() -> None:
     restitution = select(
         _inputs("en"), _layer_a(_score(SUIVI, V2, 20)), None, [], RULES

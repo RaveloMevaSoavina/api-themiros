@@ -138,7 +138,7 @@ async def test_empty_queue_does_nothing() -> None:
     repository = FakeRepository([], _inputs())
     assert await _worker(repository).run_once() is False
     assert repository.claims == [
-        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0+restitution/1.1.0")
+        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0+restitution/1.2.0")
     ]
 
 
@@ -567,9 +567,9 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     ]
     assert all(len(action["projections"]) == 3 for action in restitution["actions"])
     rules = results["rules"]["restitution"]
-    assert rules["engine_version"] == "restitution/1.1.0"
+    assert rules["engine_version"] == "restitution/1.2.0"
     assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
-    assert rules["ai"]["prompt"] == "formulate_restitution_v1.0"
+    assert rules["ai"]["prompt"] == "formulate_restitution_v1.1"
     assert results["summary"]["actions"] == 2
     assert repository.failures == []
 
