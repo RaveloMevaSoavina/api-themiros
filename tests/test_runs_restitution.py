@@ -14,6 +14,7 @@ from app.modules.runs.restitution import (
     RawItem,
     RawProjection,
     RawRestitution,
+    RawTranslation,
     RestitutionRules,
     build_batch,
     interpret,
@@ -399,6 +400,79 @@ def test_the_ai_writes_items_conclusion_and_actions() -> None:
     )
     assert (second["origin_type"], second["alert_id"]) == ("alert", str(alert.id))
     assert second["pillar_id"] is None and len(second["projections"]) == 3
+
+
+def test_the_same_call_asks_for_the_other_interface_languages() -> None:
+    restitution, batch, _ = _full_restitution()
+
+    assert batch.content["tr"] == ["en"] and batch.locales == ("en",)
+    assert restitution.locale == "fr"
+    english = build_batch("en", restitution, {}, RULES)
+    spanish = build_batch("es", restitution, {}, RULES)
+    assert english is not None and english.content["tr"] == ["fr"]
+    assert spanish is not None and spanish.content["tr"] == ["fr", "en"]
+    # Chaque traduction réécrit tout : une langue de plus, un budget de plus.
+    assert spanish.max_output_tokens * 2 == english.max_output_tokens * 3
+
+
+def test_translations_follow_what_was_written() -> None:
+    restitution, batch, _ = _full_restitution()
+    english = {
+        persona: RawProjection(f"Action ({persona}) in English.", "the gap is major")
+        for persona in ("decideur", "pmu", "analyste")
+    }
+    raw = RawRestitution(
+        items=(
+            RawItem("P1", "L'exécution budgétaire progresse.", ("E1",)),
+            RawItem("W1", "  ", ("E3",)),
+            RawItem("V1", "Écart de pertinence à vérifier.", ("E2",)),
+        ),
+        conclusion="Les résultats suggèrent un progrès.\n\nSous réserve.",
+        actions=(
+            RawAction("W1", ("E3",), _projections()),
+            RawAction("V1", ("E2",), _projections()),
+        ),
+        translations={
+            "en": RawTranslation(
+                items={"P1": "Budget execution improves.", "W1": "Weak relevance."},
+                conclusion="Results suggest progress.\n\nSubject to review.",
+                actions={
+                    "V1": english,
+                    # Sans ses trois projections : non traduite.
+                    "W1": {"decideur": english["decideur"]},
+                },
+            ),
+            # Langue non demandée : ignorée.
+            "es": RawTranslation(items={"P1": "Mejora."}, conclusion="Sí.", actions={}),
+        },
+    )
+
+    interpret(restitution, batch, raw)
+
+    progress = restitution.items("progres")[0]
+    assert progress.translations == {"en": "Budget execution improves."}
+    # W1 garde son libellé factuel : rien à traduire.
+    assert restitution.items("faiblesse")[0].translations == {}
+    assert restitution.items("a_verifier")[0].translations == {}
+    assert restitution.conclusion_translations == {
+        "en": "Results suggest progress.\n\nSubject to review."
+    }
+    w1, v1 = restitution.actions
+    assert all(projection.translations == {} for projection in w1.projections)
+    assert v1.projections[1].translations == {
+        "en": {"text": "Action (pmu) in English.", "justification": "the gap is major"}
+    }
+
+    payload = restitution.payload()
+    assert payload["synthesis"]["locale"] == "fr"
+    assert payload["synthesis"]["translations"] == {
+        "en": {"conclusion": "Results suggest progress.\n\nSubject to review."}
+    }
+    assert payload["items"][0]["translations"] == {"en": "Budget execution improves."}
+    assert payload["actions"][1]["projections"][0]["translations"]["en"] == {
+        "text": "Action (decideur) in English.",
+        "justification": "the gap is major",
+    }
 
 
 def test_long_actions_and_a_narrative_conclusion_are_kept_whole() -> None:

@@ -349,6 +349,38 @@ def test_report_follows_locale_and_persona() -> None:
     assert built.validation == "Not validated"
 
 
+def test_the_restitution_follows_the_export_language() -> None:
+    base = rows()
+    item = {**base.items[0], "translations": {"en": "Check the efficiency gap."}}
+    action = {
+        **base.actions[0],
+        "run_action_projections": [
+            {
+                **projection,
+                "translations": {
+                    "en": {"text": "Document the committee.", "justification": "x"}
+                },
+            }
+            for projection in base.actions[0]["run_action_projections"]
+        ],
+    }
+    synthesis = {
+        **base.synthesis,
+        "translations": {"en": {"conclusion": "First.\n\nSecond."}},
+    }
+    overrides = {"items": [item], "actions": [action], "synthesis": synthesis}
+
+    english = report(locale="en", **overrides)
+    french = report(locale="fr", **overrides)
+
+    assert english.synthesis[0].text == "Check the efficiency gap."
+    assert english.conclusion == "First.\n\nSecond."
+    assert english.actions[0].text == "Document the committee."
+    # Sans traduction dans la langue demandée : le texte d'origine.
+    assert french.synthesis[0].text == "Vérifier l'écart sur l'efficacité."
+    assert french.actions[0].text == "Documenter le suivi du comité."
+
+
 def test_pdf_opens_with_exploratory_banner_first() -> None:
     document = pymupdf.open("pdf", render_pdf(report()))
     first_page = document[0].get_text()

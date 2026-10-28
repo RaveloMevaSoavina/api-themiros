@@ -28,6 +28,7 @@ from app.modules.runs.restitution import (
     RawItem,
     RawProjection,
     RawRestitution,
+    RawTranslation,
     RestitutionBatch,
 )
 
@@ -90,10 +91,32 @@ class LlmRestitutionAction(BaseModel):
     ana: LlmProjection
 
 
+class LlmTranslatedItem(BaseModel):
+    k: str
+    t: str
+
+
+class LlmTranslatedAction(BaseModel):
+    k: str
+    dec: LlmProjection
+    pmu: LlmProjection
+    ana: LlmProjection
+
+
+class LlmRestitutionTranslation(BaseModel):
+    """Constats, conclusion et actions dans une langue de `tr`."""
+
+    l: str  # noqa: E741 (clé courte du schéma)
+    i: list[LlmTranslatedItem]
+    c: str
+    a: list[LlmTranslatedAction]
+
+
 class LlmRestitutionOutput(BaseModel):
     i: list[LlmRestitutionItem]
     c: str
     a: list[LlmRestitutionAction]
+    tr: list[LlmRestitutionTranslation]
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +329,22 @@ class OpenAIRestitutionWriter(OpenAIStructuredCall):
                     )
                     for item in parsed.a
                 ),
+                translations={
+                    translation.l: RawTranslation(
+                        items={item.k: item.t for item in translation.i},
+                        conclusion=translation.c,
+                        actions={
+                            item.k: {
+                                persona: RawProjection(
+                                    getattr(item, key).t, getattr(item, key).j
+                                )
+                                for persona, key in PERSONA_KEYS.items()
+                            }
+                            for item in translation.a
+                        },
+                    )
+                    for translation in parsed.tr
+                },
             ),
             usage,
         )

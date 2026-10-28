@@ -94,10 +94,13 @@ default severity and message (`qualified = false`).
 The restitution (`restitution.py`) selects up to three progress points,
 weaknesses and areas to verify, plus the action origins, with deterministic
 rules; weaknesses are relative (the weakest pillars below 80/100 and criteria
-below 2.4/3). A single `formulate_restitution` call (prompt v1.1) writes the
+below 2.4/3). A single `formulate_restitution` call (prompt v1.2) writes the
 findings, a cautious narrative conclusion (two or three paragraphs) and each
 action worded for the three personas, in one or two full sentences with
-their reason. Without
+their reason. The same call also translates the findings, the
+conclusion and the actions into the other interface languages (fr, en),
+stored in `translations` columns; the dashboard and exports fall back to the
+run's language when a translation is missing. Without
 AI, findings keep a factual label, with no conclusion and no action plan; the
 synthesis `status` says why (`not_needed`, `disabled` or `failed`, otherwise
 `completed`). AI usage is stored in `rules_applied.engine.restitution.ai`.
@@ -127,7 +130,7 @@ Costs use `OPENAI_INPUT_COST_EUR_PER_MILLION`,
 `OPENAI_EMBEDDING_COST_EUR_PER_MILLION` at call time (0 when unset). Cached
 input tokens are priced as regular input, so costs are slightly overstated
 when OpenAI's prompt cache applies. The dashboard reads the totals through
-`workspace_ai_usage` (Settings › General › AI usage).
+`workspace_ai_usage` (account menu › AI usage, for the open workspace).
 
 ## Run exports (E14)
 

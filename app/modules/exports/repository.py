@@ -95,16 +95,16 @@ class ExportRepository:
                 "documents(original_filename)",
                 order="created_at,id",
             ),
-            select("syntheses", "conclusion,limits,status"),
+            select("syntheses", "conclusion,limits,status,translations"),
             select(
                 "synthesis_items",
-                "id,section,position,text,pillar_id,criterion_id,alert_id,"
-                "synthesis_item_evidences(evidence_id)",
+                "id,section,position,text,translations,pillar_id,criterion_id,"
+                "alert_id,synthesis_item_evidences(evidence_id)",
             ),
             select(
                 "run_actions",
                 "id,position,origin_type,pillar_id,criterion_id,alert_id,"
-                "run_action_projections(persona,text,justification),"
+                "run_action_projections(persona,text,justification,translations),"
                 "run_action_evidences(evidence_id)",
             ),
             self._gateway.rpc_value(

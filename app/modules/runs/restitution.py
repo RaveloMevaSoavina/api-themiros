@@ -43,13 +43,16 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from app.modules.frameworks.schemas import INTERFACE_LOCALES
 from app.modules.runs.domain import LayerAResults, PillarScore
 from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.layer_c import Alert, LayerCInputs, ordered_segments
 
-RESTITUTION_VERSION = "restitution/1.2.0"
+RESTITUTION_VERSION = "restitution/1.3.0"
 PROMPT_CODE = "formulate_restitution"
-PROMPT_VERSION = "v1.1"
+# v1.2 : le même appel traduit aussi la restitution dans les autres langues
+# de l'interface (`tr`).
+PROMPT_VERSION = "v1.2"
 
 Section = Literal["progres", "faiblesse", "a_verifier"]
 # Rédaction de la synthèse : faite, inutile (aucun constat), IA désactivée,
@@ -111,6 +114,8 @@ class Finding:
     program_version_id: UUID | None = None
     criterion_id: UUID | None = None
     alert_id: UUID | None = None
+    # Constat traduit, par langue de l'interface (autre que celle du run).
+    translations: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +123,8 @@ class Projection:
     persona: str
     text: str
     justification: str
+    # Langue -> {"text", "justification"}.
+    translations: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -161,12 +168,25 @@ class RawAction:
 
 
 @dataclass(frozen=True, slots=True)
+class RawTranslation:
+    """Traduction de la réponse dans une langue : constats et actions par
+    identifiant court."""
+
+    items: Mapping[str, str]
+    conclusion: str
+    # Identifiant -> persona -> formulation.
+    actions: Mapping[str, Mapping[str, RawProjection]]
+
+
+@dataclass(frozen=True, slots=True)
 class RawRestitution:
     """Réponse brute de l'IA (identifiants courts)."""
 
     items: tuple[RawItem, ...]
     conclusion: str
     actions: tuple[RawAction, ...]
+    # Langue -> traduction ; seules les langues demandées (`tr`) comptent.
+    translations: Mapping[str, RawTranslation] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -180,6 +200,8 @@ class RestitutionBatch:
     # Extraits proposés pour chaque candidat : seuls citables (GF-1).
     allowed: dict[str, frozenset[str]] = field(default_factory=dict)
     origins: tuple[str, ...] = ()
+    # Langues de traduction demandées (`tr`), hors langue de rédaction.
+    locales: tuple[str, ...] = ()
     estimated_input_tokens: int = 0
     max_output_tokens: int = 0
 
@@ -195,6 +217,9 @@ class Restitution:
     conclusion: str | None = None
     qualified: bool = False
     ai: dict[str, Any] = field(default_factory=dict)
+    # Langue de rédaction (celle de l'approche) et conclusion traduite.
+    locale: str | None = None
+    conclusion_translations: dict[str, str] = field(default_factory=dict)
 
     @property
     def status(self) -> Status:
@@ -249,6 +274,11 @@ class Restitution:
                 "limits": self.limits.as_dict(),
                 "qualified": self.qualified,
                 "status": self.status,
+                "locale": self.locale,
+                "translations": {
+                    locale: {"conclusion": conclusion}
+                    for locale, conclusion in self.conclusion_translations.items()
+                },
             },
             "items": [
                 {
@@ -256,6 +286,7 @@ class Restitution:
                     "section": section,
                     "position": position,
                     "text": finding.text,
+                    "translations": finding.translations,
                     **origin(finding),
                     "segment_ids": [str(segment) for segment in finding.segment_ids],
                 }
@@ -572,6 +603,7 @@ def select(
     return Restitution(
         limits=corpus_limits(layer_a, layer_b, rules),
         findings=progresses + weaknesses + to_verify + partial,
+        locale=inputs.locale,
     )
 
 
@@ -585,7 +617,9 @@ def build_batch(
     if not restitution.findings:
         return None
     limits = restitution.limits
+    targets = tuple(other for other in INTERFACE_LOCALES if other != locale)
     batch = RestitutionBatch(
+        locales=targets,
         content={
             "lang": locale,
             "l": {
@@ -595,7 +629,7 @@ def build_batch(
                 "ld": limits.leads,
             },
             "x": {},
-        }
+        },
     )
     key_of_segment: dict[UUID, str] = {}
     for finding in restitution.findings:
@@ -623,11 +657,14 @@ def build_batch(
     ]
     if batch.origins:
         batch.content["o"] = list(batch.origins)
+    if targets:
+        batch.content["tr"] = list(targets)
     items = sum(finding.section is not None for finding in restitution.findings)
     batch.estimated_input_tokens = SYSTEM_PROMPT_TOKENS + (
         len(batch.message()) // CHARS_PER_TOKEN
     )
-    batch.max_output_tokens = (
+    # Chaque traduction réécrit constats, conclusion et actions.
+    batch.max_output_tokens = (1 + len(targets)) * (
         OUTPUT_TOKENS_CONCLUSION
         + OUTPUT_TOKENS_PER_ITEM * items
         + OUTPUT_TOKENS_PER_ACTION * len(batch.origins)
@@ -667,6 +704,19 @@ def _narrative(text: str, limit: int) -> str:
     return cut.rstrip() + "…"
 
 
+def _projection(projection: RawProjection | None) -> dict[str, str] | None:
+    """Formulation exploitable, ou `None` (texte ou raison manquant)."""
+    if projection is None or not projection.text.strip():
+        return None
+    reason = _reason(projection.justification)
+    if not reason:
+        return None
+    return {
+        "text": truncate(projection.text, PROJECTION_CHARS),
+        "justification": reason,
+    }
+
+
 def interpret(
     restitution: Restitution,
     batch: RestitutionBatch,
@@ -675,7 +725,17 @@ def interpret(
 ) -> None:
     """Applique la réponse de l'IA. Une puce sans texte garde son libellé
     factuel ; sans extrait valable, elle garde ses preuves. Une action sans
-    ses trois projections, ou hors des origines proposées, est ignorée."""
+    ses trois projections, ou hors des origines proposées, est ignorée.
+
+    Traductions : seules les langues demandées comptent, et seulement pour
+    ce qui a été rédigé dans la langue du run. Une action n'est traduite
+    qu'avec ses trois projections ; ce qui manque s'affiche dans la langue
+    du run."""
+    translations = {
+        locale: raw.translations[locale]
+        for locale in batch.locales
+        if locale in raw.translations
+    }
     seen: set[str] = set()
     for item in raw.items:
         finding = batch.findings.get(item.key)
@@ -684,6 +744,10 @@ def interpret(
         seen.add(item.key)
         if item.text and item.text.strip():
             finding.text = truncate(item.text, ITEM_CHARS)
+            for locale, translation in translations.items():
+                text = (translation.items.get(item.key) or "").strip()
+                if text:
+                    finding.translations[locale] = truncate(text, ITEM_CHARS)
         cited = _cited(batch, item.key, item.excerpts)
         if cited:
             finding.segment_ids = cited
@@ -692,6 +756,13 @@ def interpret(
     restitution.conclusion = (
         _narrative(conclusion, CONCLUSION_CHARS) if conclusion else None
     )
+    if restitution.conclusion:
+        for locale, translation in translations.items():
+            translated = (translation.conclusion or "").strip()
+            if translated:
+                restitution.conclusion_translations[locale] = _narrative(
+                    translated, CONCLUSION_CHARS
+                )
 
     actions: dict[str, Action] = {}
     for raw_action in raw.actions:
@@ -702,29 +773,37 @@ def interpret(
             or raw_action.key in actions
         ):
             continue
-        projections: list[Projection] = []
-        for persona in PERSONAS:
-            projection = raw_action.projections.get(persona)
-            if (
-                projection is None
-                or not projection.text.strip()
-                or not _reason(projection.justification)
-            ):
-                break
-            projections.append(
+        written = {
+            persona: _projection(raw_action.projections.get(persona))
+            for persona in PERSONAS
+        }
+        if not all(written.values()):
+            continue
+        translated: dict[str, dict[str, dict[str, str]]] = {}
+        for locale, translation in translations.items():
+            by_persona = translation.actions.get(raw_action.key) or {}
+            versions = {
+                persona: _projection(by_persona.get(persona)) for persona in PERSONAS
+            }
+            if all(versions.values()):
+                translated[locale] = versions
+        actions[raw_action.key] = Action(
+            id=new_id(),
+            finding=finding,
+            segment_ids=_cited(batch, raw_action.key, raw_action.excerpts)
+            or finding.segment_ids,
+            projections=[
                 Projection(
                     persona,
-                    truncate(projection.text, PROJECTION_CHARS),
-                    _reason(projection.justification),
+                    written[persona]["text"],
+                    written[persona]["justification"],
+                    {
+                        locale: versions[persona]
+                        for locale, versions in translated.items()
+                    },
                 )
-            )
-        else:
-            actions[raw_action.key] = Action(
-                id=new_id(),
-                finding=finding,
-                segment_ids=_cited(batch, raw_action.key, raw_action.excerpts)
-                or finding.segment_ids,
-                projections=projections,
-            )
+                for persona in PERSONAS
+            ],
+        )
     restitution.actions = [actions[key] for key in batch.origins if key in actions]
     restitution.qualified = True

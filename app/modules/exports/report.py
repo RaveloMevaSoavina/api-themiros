@@ -612,7 +612,7 @@ def build_report(
         SynthesisLine(
             section=row["section"],
             position=int(row["position"]),
-            text=row["text"],
+            text=(row.get("translations") or {}).get(locale) or row["text"],
             origin=origin(row, kind_of(row)),
             notes=citations.cite(_evidence_ids(row, "synthesis_item_evidences")),
         )
@@ -636,6 +636,9 @@ def build_report(
         )
         if projection is None:
             continue
+        # Traduction du run (prompt v1.2) si elle existe dans la langue
+        # demandée, sinon la langue de rédaction.
+        projection = (projection.get("translations") or {}).get(locale) or projection
         actions.append(
             ActionLine(
                 position=int(row["position"]),
@@ -668,7 +671,12 @@ def build_report(
         criteria=criteria,
         alerts=alerts,
         synthesis=synthesis,
-        conclusion=(rows.synthesis or {}).get("conclusion"),
+        conclusion=(
+            ((rows.synthesis or {}).get("translations") or {})
+            .get(locale, {})
+            .get("conclusion")
+            or (rows.synthesis or {}).get("conclusion")
+        ),
         restitution_status=(rows.synthesis or {}).get("status"),
         actions=actions,
         limits=[],
