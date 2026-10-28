@@ -28,9 +28,14 @@ OFF_TOPIC = (
 
 def _pdf(text: str, pages: int = 1) -> bytes:
     document = pymupdf.open()
-    for _ in range(pages):
+    for number in range(1, pages + 1):
         page = document.new_page()
-        page.insert_textbox(pymupdf.Rect(40, 40, 560, 800), text, fontsize=10)
+        # Pages distinctes : un texte répété n'est vectorisé qu'une fois.
+        page.insert_textbox(
+            pymupdf.Rect(40, 40, 560, 800),
+            f"Rapport numero {number}. {text}",
+            fontsize=10,
+        )
     return document.tobytes()
 
 
@@ -59,7 +64,9 @@ class FakeRepository:
         self.pages: list[dict[str, Any]] = []
         self.qualification: dict[str, Any] | None = None
         self.segments: list[dict[str, Any]] = []
+        self.pending: list[dict[str, Any]] = []
         self.published = 0
+        self.indexed_at: str | None = None
         self.fingerprint: tuple[str, list[float]] | None = None
         self.fingerprint_saves = 0
         self.overrides: dict[str, str] = {}
@@ -89,6 +96,7 @@ class FakeRepository:
             status=self.status,
             status_reason_code=None,
             detected_language="fr",
+            indexed_at=self.indexed_at,
         )
 
     async def load_profile(self, workspace_id):
@@ -135,6 +143,13 @@ class FakeRepository:
         self.fingerprint = (source_hash, vector)
         self.fingerprint_saves += 1
 
+    async def load_indexed_vectors(self, document_id, model):
+        return {
+            row["text"]: row["embedding"]
+            for row in self.segments
+            if row["model"] == model
+        }
+
     async def commit_extraction(self, job, *, pages, pdf_type, metadata):
         self.pages = pages
 
@@ -146,11 +161,14 @@ class FakeRepository:
         return {"status": result["status"]}
 
     async def append_segments(self, job, generation, rows):
-        self.segments.extend(rows)
+        self.pending.extend(rows)
         return len(rows)
 
     async def publish_index(self, job, generation, model):
+        # La nouvelle génération remplace l'ancienne.
+        self.segments, self.pending = self.pending, []
         self.published = len(self.segments)
+        self.indexed_at = "2026-10-28T00:00:00Z"
         return self.published
 
     async def heartbeat(self, job, stage=None):
@@ -279,7 +297,7 @@ async def test_rejected_document_only_embeds_the_sample() -> None:
 
 
 async def test_fingerprint_embedding_is_cached_between_documents() -> None:
-    repository = FakeRepository(_pdf(RELEVANT))
+    repository = FakeRepository(_pdf(OFF_TOPIC))
     embedder = FakeEmbedder()
     pipeline = _pipeline(repository, embedder)
     await _worker(repository, pipeline).process(repository.job())
@@ -287,8 +305,47 @@ async def test_fingerprint_embedding_is_cached_between_documents() -> None:
     await _worker(repository, pipeline).process(repository.job("requalify"))
 
     assert repository.fingerprint_saves == 1
-    # Requalification : un seul appel (segments), l'empreinte vient du cache.
+    # Requalification : un seul appel (échantillon), l'empreinte vient du cache.
     assert embedder.calls == calls_after_first + 1
+
+
+async def test_requalifying_an_indexed_document_reuses_its_vectors() -> None:
+    repository = FakeRepository(_pdf(RELEVANT, pages=6))
+    embedder = RecordingEmbedder()
+    pipeline = _pipeline(repository, embedder, sample_segments=2)
+    await _worker(repository, pipeline).process(repository.job())
+    indexed = repository.published
+    batches = len(embedder.batches)
+
+    await _worker(repository, pipeline).process(repository.job("requalify"))
+
+    assert repository.failures == []
+    assert repository.qualification is not None
+    assert repository.qualification["status"] == "conforme"
+    # Texte inchangé, même modèle : ni l'échantillon ni l'index ne repartent
+    # au modèle d'embeddings.
+    assert len(embedder.batches) == batches
+    assert repository.published == indexed
+    assert all(row["embedding"] == [1.0, 0.0] for row in repository.segments)
+
+
+async def test_vectors_of_another_model_are_not_reused() -> None:
+    repository = FakeRepository(_pdf(RELEVANT, pages=6))
+    embedder = RecordingEmbedder()
+    pipeline = _pipeline(repository, embedder, sample_segments=2)
+    await _worker(repository, pipeline).process(repository.job())
+    embedder.batches.clear()
+
+    embedder.model = "other-embedding"
+    await _worker(repository, pipeline).process(repository.job("requalify"))
+
+    # Empreinte (nouveau modèle), échantillon, puis le reste du document.
+    assert [len(batch) for batch in embedder.batches] == [
+        1,
+        2,
+        repository.published - 2,
+    ]
+    assert {row["model"] for row in repository.segments} == {"other-embedding"}
 
 
 async def test_human_correction_of_country_takes_precedence() -> None:

@@ -15,6 +15,9 @@ from app.infrastructure.supabase import SupabaseGateway
 from app.modules.ingestion.analysis.segmenter import PageText
 from app.modules.ingestion.domain import IngestionRules, WorkspaceProfile
 
+# ~10 Ko par segment (texte + vecteur 768) : ~5 Mo par page de lecture.
+INDEXED_VECTORS_PAGE_SIZE = 500
+
 
 @dataclass(frozen=True, slots=True)
 class ClaimedJob:
@@ -52,6 +55,7 @@ class DocumentRecord:
     status: str
     status_reason_code: str | None
     detected_language: str | None
+    indexed_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +169,7 @@ class IngestionRepository:
                 "deleted_at": "is.null",
                 "select": (
                     "id,workspace_id,original_filename,storage_path,file_hash,"
-                    "mime_type,status,status_reason_code,detected_language"
+                    "mime_type,status,status_reason_code,detected_language,indexed_at"
                 ),
                 "limit": "1",
             },
@@ -187,6 +191,7 @@ class IngestionRepository:
             status=row["status"],
             status_reason_code=row.get("status_reason_code"),
             detected_language=row.get("detected_language"),
+            indexed_at=row.get("indexed_at"),
         )
 
     async def load_profile(
@@ -320,9 +325,7 @@ class IngestionRepository:
         )
         if not rows or not rows[0].get("source_hash") or not rows[0].get("embedding"):
             return None
-        embedding = rows[0]["embedding"]
-        vector = json.loads(embedding) if isinstance(embedding, str) else embedding
-        return rows[0]["source_hash"], [float(value) for value in vector]
+        return rows[0]["source_hash"], parse_vector(rows[0]["embedding"])
 
     async def save_fingerprint(
         self,
@@ -351,6 +354,32 @@ class IngestionRepository:
                 "model": model,
             },
         )
+
+    async def load_indexed_vectors(
+        self, document_id: UUID, model: str
+    ) -> dict[str, list[float]]:
+        """Vecteurs publiés du document pour ce modèle, par texte de segment :
+        un segment inchangé n'est pas revectorisé."""
+        vectors: dict[str, list[float]] = {}
+        offset = 0
+        while True:
+            rows = await self._gateway.service_select(
+                "segment_embeddings",
+                params={
+                    "select": "embedding,segments!inner(text)",
+                    "model": f"eq.{model}",
+                    "segments.document_id": f"eq.{document_id}",
+                    "segments.published": "is.true",
+                    "order": "segment_id",
+                    "limit": str(INDEXED_VECTORS_PAGE_SIZE),
+                    "offset": str(offset),
+                },
+            )
+            for row in rows:
+                vectors[row["segments"]["text"]] = parse_vector(row["embedding"])
+            if len(rows) < INDEXED_VECTORS_PAGE_SIZE:
+                return vectors
+            offset += len(rows)
 
     # --- Écritures du pipeline ----------------------------------------------
 
@@ -420,3 +449,9 @@ class IngestionRepository:
 
 def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(f"{value:.8f}" for value in vector) + "]"
+
+
+def parse_vector(value: str | list[float]) -> list[float]:
+    """pgvector est servi en texte (`[0.1,0.2]`) par PostgREST."""
+    vector = json.loads(value) if isinstance(value, str) else value
+    return [float(item) for item in vector]

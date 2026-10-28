@@ -2,8 +2,9 @@
 décision → segmentation → indexation, chaque étape journalisée.
 
 Les étapes repartent de ce qui est conservé en base : requalifier ou indexer
-ne refait jamais l'OCR, et les vecteurs calculés pour le score servent aussi
-à l'indexation.
+ne refait jamais l'OCR, les vecteurs calculés pour le score servent aussi à
+l'indexation, et un segment déjà indexé avec le même texte et le même modèle
+n'est jamais revectorisé (requalification après un changement d'empreinte).
 """
 
 import asyncio
@@ -75,9 +76,9 @@ class QualificationOutcome:
     country: Detection
     status: str
     segments: list[Segment]
-    # Vecteurs déjà calculés pour le score, par indice de segment : ils sont
+    # Vecteurs connus à l'issue du score, par texte de segment : ils sont
     # réutilisés à l'indexation.
-    sampled_vectors: dict[int, list[float]]
+    vectors: dict[str, list[float]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,10 +131,11 @@ class IngestionPipeline:
                 return result
         else:
             stored = await self._repository.load_pages(job.document_id)
+        indexed = await self._indexed_vectors(document)
 
         if job.kind in {"full", "requalify", "qualify"}:
             qualification = await self.qualify(
-                job, profile, financier_terms, rules, stored, on_stage
+                job, profile, financier_terms, rules, stored, on_stage, indexed
             )
             result["qualification"] = {
                 "status": qualification.status,
@@ -145,14 +147,14 @@ class IngestionPipeline:
             }
             # Spec §9.4 : indexation à la fin de l'ingestion, si conforme.
             if job.kind != "qualify" and is_eligible_for_index(qualification.status):
-                indexed = await self.index(
+                outcome = await self.index(
                     job,
                     qualification.segments,
                     qualification.language.value,
                     on_stage,
-                    known_vectors=qualification.sampled_vectors,
+                    known_vectors={**indexed, **qualification.vectors},
                 )
-                result["indexation"] = {"segments_count": indexed.segments_count}
+                result["indexation"] = {"segments_count": outcome.segments_count}
             return result
 
         if job.kind == "index":
@@ -166,10 +168,14 @@ class IngestionPipeline:
                     ),
                 )
             segments = await asyncio.to_thread(segment_pages, stored.pages)
-            indexed = await self.index(
-                job, segments, document.detected_language, on_stage
+            outcome = await self.index(
+                job,
+                segments,
+                document.detected_language,
+                on_stage,
+                known_vectors=indexed,
             )
-            result["indexation"] = {"segments_count": indexed.segments_count}
+            result["indexation"] = {"segments_count": outcome.segments_count}
             return result
 
         raise IngestionError(
@@ -251,6 +257,7 @@ class IngestionPipeline:
         rules: IngestionRules,
         stored: StoredPages,
         on_stage: StageCallback,
+        known_vectors: Mapping[str, list[float]] | None = None,
     ) -> QualificationOutcome:
         await on_stage("detection")
         text = "\n\n".join(page.text for page in stored.pages)
@@ -279,9 +286,10 @@ class IngestionPipeline:
         sample = sample_indices(
             len(segments), self._settings.ingestion_relevance_sample_segments
         )
-        sample_vectors = await self._embedder.embed(
-            [segments[index].text for index in sample]
+        vectors = await self._embed(
+            [segments[index].text for index in sample], known_vectors or {}
         )
+        sample_vectors = [vectors[segments[index].text] for index in sample]
         semantic = semantic_score(
             sample_vectors,
             fingerprint,
@@ -358,7 +366,7 @@ class IngestionPipeline:
             country,
             status,
             segments,
-            dict(zip(sample, sample_vectors, strict=True)),
+            vectors,
         )
 
     async def index(
@@ -367,17 +375,13 @@ class IngestionPipeline:
         segments: Sequence[Segment],
         language: str | None,
         on_stage: StageCallback,
-        known_vectors: Mapping[int, Sequence[float]] | None = None,
+        known_vectors: Mapping[str, list[float]] | None = None,
     ) -> IndexOutcome:
         await on_stage("indexation")
-        known = dict(known_vectors or {})
-        missing = [index for index in range(len(segments)) if index not in known]
-        if missing:
-            computed = await self._embedder.embed(
-                [segments[index].text for index in missing]
-            )
-            known.update(zip(missing, computed, strict=True))
-        vectors = [known[index] for index in range(len(segments))]
+        known = await self._embed(
+            [segment.text for segment in segments], known_vectors or {}
+        )
+        vectors = [known[segment.text] for segment in segments]
         generation = uuid4()
         for start in range(0, len(segments), SEGMENT_BATCH_SIZE):
             rows = [
@@ -404,6 +408,29 @@ class IngestionPipeline:
             job, generation, self._embedder.model
         )
         return IndexOutcome(segments_count=published, embeddings_count=published)
+
+    async def _embed(
+        self, texts: Sequence[str], known: Mapping[str, list[float]]
+    ) -> dict[str, list[float]]:
+        """Vecteurs de `texts` par texte : seuls ceux absents de `known` sont
+        envoyés au modèle."""
+        vectors = {text: known[text] for text in texts if text in known}
+        # Un texte répété dans le document n'est vectorisé qu'une fois.
+        missing = list(dict.fromkeys(text for text in texts if text not in vectors))
+        if missing:
+            computed = await self._embedder.embed(missing)
+            vectors.update(zip(missing, computed, strict=True))
+        return vectors
+
+    async def _indexed_vectors(
+        self, document: DocumentRecord
+    ) -> dict[str, list[float]]:
+        """Vecteurs du dernier index publié, si le document en a un."""
+        if document.indexed_at is None:
+            return {}
+        return await self._repository.load_indexed_vectors(
+            document.id, self._embedder.model
+        )
 
     async def _fingerprint(self, profile: WorkspaceProfile) -> list[float]:
         """L'embedding de l'empreinte n'est recalculé que si elle change."""
