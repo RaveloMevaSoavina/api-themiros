@@ -166,6 +166,7 @@ async def test_openai_provider_returns_validated_structured_output() -> None:
     assert len(result.pillars) == 5
     assert sum(pillar.weight for pillar in result.pillars) == Decimal("100")
     assert result.tokens_used == 1500
+    assert (result.input_tokens, result.output_tokens) == (1000, 500)
     assert result.cost_eur == Decimal("0.006000")
     assert result.generation_mode == "ai"
     assert client.responses.last_request["text_format"] is LlmPillarOutput

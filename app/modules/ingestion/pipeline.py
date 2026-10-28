@@ -52,6 +52,7 @@ from app.modules.ingestion.repository import (
     IngestionRepository,
     StoredPages,
 )
+from app.modules.usage.ledger import UsageLedger
 
 StageCallback = Callable[[str], Awaitable[None]]
 # ~10 Ko par segment (texte + vecteur 768) : ~1,3 Mo par appel.
@@ -92,14 +93,26 @@ class IngestionPipeline:
         embedder: Embedder,
         country_detector: CountryDetector,
         settings: Settings,
+        ledger: UsageLedger | None = None,
     ) -> None:
         self._repository = repository
         self._embedder = embedder
         self._countries = country_detector
         self._settings = settings
+        self._ledger = ledger or UsageLedger(None, settings)
 
     async def run(self, job: ClaimedJob, on_stage: StageCallback) -> dict[str, Any]:
-        """Exécute une tâche de la file selon son type."""
+        """Exécute une tâche de la file selon son type. Les embeddings du
+        document sont inscrits au registre de consommation, même en échec."""
+        async with self._ledger.embeddings(
+            workspace_id=job.workspace_id,
+            document_id=job.document_id,
+            source="ingestion",
+            model=self._embedder.model,
+        ):
+            return await self._run(job, on_stage)
+
+    async def _run(self, job: ClaimedJob, on_stage: StageCallback) -> dict[str, Any]:
         document = await self._repository.load_document(job.document_id)
         profile, financier_terms = await self._repository.load_profile(job.workspace_id)
         rules = await self._repository.load_rules(job.workspace_id)

@@ -30,6 +30,7 @@ from app.modules.runs.restitution import (
     RawRestitution,
 )
 from app.modules.runs.worker import RunWorker
+from app.modules.usage.ledger import UsageLedger, count_embedding
 
 VERSION = UUID("55555555-5555-4555-8555-555555555555")
 VARIABLE = UUID("33333333-3333-4333-8333-333333333333")
@@ -321,6 +322,48 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     )
     assert summary["concluded"] == 1 and summary["ai_calls"] == 1
     assert repository.failures == []
+
+
+class CountingEmbedder(FakeEmbedder):
+    async def embed(self, texts):
+        count_embedding(7 * len(texts))
+        return await super().embed(texts)
+
+
+class FakeUsageGateway:
+    def __init__(self) -> None:
+        self.inserted: list[dict] = []
+
+    async def service_insert(self, path, *, payload):
+        assert path == "ai_usage"
+        self.inserted.append(payload)
+
+
+async def test_the_run_ai_usage_is_recorded_by_source() -> None:
+    repository = _layer_b_repository()
+    gateway = FakeUsageGateway()
+    worker = RunWorker(
+        repository,
+        Settings(),
+        worker_id="host-1",
+        embedder=CountingEmbedder(),
+        grader=FakeGrader(),
+        ledger=UsageLedger(gateway, Settings()),
+    )
+
+    await worker.run_once()
+
+    (run_id,) = {payload["run_id"] for payload in gateway.inserted}
+    assert run_id is not None
+    by_source = {payload["source"]: payload for payload in gateway.inserted}
+    assert set(by_source) == {"layer_b_search", "layer_b"}
+    search = by_source["layer_b_search"]
+    assert search["kind"] == "embedding"
+    assert search["input_tokens"] == 7 * len(QUESTIONS)
+    grading = by_source["layer_b"]
+    assert grading["kind"] == "completion" and grading["model"] == "test-llm"
+    assert (grading["input_tokens"], grading["output_tokens"]) == (1200, 80)
+    assert grading["cost_eur"] == "0.0021"
 
 
 async def test_without_ai_the_criteria_are_not_concluded() -> None:

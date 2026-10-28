@@ -186,6 +186,8 @@ class OpenAIPillarGenerator:
                 rationale=parsed.rationale,
                 prompt_version=f"{context.prompt.code}_{context.prompt.version}",
                 tokens_used=usage.total_tokens if usage else 0,
+                input_tokens=usage.input_tokens if usage else 0,
+                output_tokens=usage.output_tokens if usage else 0,
                 cost_eur=cost,
                 model=model,
                 duration_ms=elapsed_ms(started_at),

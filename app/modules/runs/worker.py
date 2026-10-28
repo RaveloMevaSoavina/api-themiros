@@ -68,6 +68,7 @@ from app.modules.runs.restitution import (
 )
 from app.modules.runs.restitution import build_batch as build_restitution_batch
 from app.modules.runs.restitution import interpret as interpret_restitution
+from app.modules.usage.ledger import UsageLedger
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +96,11 @@ class RunWorker:
         grader: SubQuestionGrader | None = None,
         qualifier: AlertQualifier | None = None,
         writer: RestitutionWriter | None = None,
+        ledger: UsageLedger | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
+        self._ledger = ledger or UsageLedger(None, settings)
         self._worker_id = f"{worker_id}#runs"
         self._stopping = asyncio.Event()
         # Sans modèle d'embeddings, la couche B n'est pas calculée ; sans
@@ -271,7 +274,13 @@ class RunWorker:
         queries = inputs.queries()
         candidates = []
         if queries:
-            vectors = await self._embedder.embed([text for _, text in queries])
+            async with self._ledger.embeddings(
+                workspace_id=run.workspace_id,
+                run_id=run.run_id,
+                source="layer_b_search",
+                model=self._embedder.model,
+            ):
+                vectors = await self._embedder.embed([text for _, text in queries])
             candidates = await self._repository.sub_question_matches(
                 run,
                 self._embedder.model,
@@ -334,7 +343,7 @@ class RunWorker:
             usages.append(usage)
             interpret(batch, raw, grading)
 
-        return grading, self._usage(ai, usages, len(batches))
+        return grading, await self._account(run, "layer_b", ai, usages, len(batches))
 
     async def _layer_c(
         self,
@@ -408,7 +417,7 @@ class RunWorker:
         return LayerCResults(
             [alert for alert in alerts if alert.id not in infirmed],
             len(alerts),
-            self._usage(ai, usages, len(batches)),
+            await self._account(run, "layer_c", ai, usages, len(batches)),
         )
 
     async def _restitution(
@@ -473,7 +482,7 @@ class RunWorker:
         else:
             usages.append(usage)
             interpret_restitution(restitution, batch, raw)
-        restitution.ai = self._usage(ai, usages, 1)
+        restitution.ai = await self._account(run, "restitution", ai, usages, 1)
         return restitution
 
     async def _prompt(self, run: ClaimedRun, code: str, version: str) -> dict | None:
@@ -487,6 +496,30 @@ class RunWorker:
             logger.warning("Run %s: prompt %s unavailable", run.run_id, code)
             return None
         return prompt if prompt.get("template") else None
+
+    async def _account(
+        self,
+        run: ClaimedRun,
+        source: str,
+        ai: dict,
+        usages: list[AiUsage],
+        batches: int,
+    ) -> dict:
+        """Résumé de l'étape (rules_applied) et inscription au registre de
+        consommation, que le run aboutisse ou non."""
+        summary = self._usage(ai, usages, batches)
+        await self._ledger.record(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            source=source,
+            kind="completion",
+            model=summary.get("model"),
+            calls=summary["calls"],
+            input_tokens=summary["input_tokens"],
+            output_tokens=summary["output_tokens"],
+            cost_eur=Decimal(summary["cost_eur"]),
+        )
+        return summary
 
     @staticmethod
     def _usage(ai: dict, usages: list[AiUsage], batches: int) -> dict:

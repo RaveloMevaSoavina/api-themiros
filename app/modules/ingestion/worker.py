@@ -29,6 +29,7 @@ from app.modules.runs.grader import (
 )
 from app.modules.runs.repository import RunRepository
 from app.modules.runs.worker import RunWorker
+from app.modules.usage.ledger import UsageLedger
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +148,14 @@ class IngestionWorker:
 def build_pipeline(
     settings: Settings, client: httpx.AsyncClient, embedder: Embedder | None = None
 ) -> tuple[IngestionRepository, IngestionPipeline]:
-    repository = IngestionRepository(SupabaseGateway(settings, client), settings)
+    gateway = SupabaseGateway(settings, client)
+    repository = IngestionRepository(gateway, settings)
     pipeline = IngestionPipeline(
         repository,
         embedder or build_embedder(settings),
         get_country_detector(settings.ingestion_ner_model),
         settings,
+        UsageLedger(gateway, settings),
     )
     return repository, pipeline
 
@@ -165,16 +168,19 @@ async def _main() -> None:
         embedder = build_embedder(settings)
         repository, pipeline = build_pipeline(settings, client, embedder)
         worker = IngestionWorker(repository, pipeline, settings)
+        ledger = UsageLedger(SupabaseGateway(settings, client), settings)
         classifier = ClassificationWorker(
             ClassificationRepository(SupabaseGateway(settings, client), settings),
             embedder,
             settings,
             worker_id=worker.worker_id,
+            ledger=ledger,
         )
         runner = RunWorker(
             RunRepository(SupabaseGateway(settings, client), settings),
             settings,
             worker_id=worker.worker_id,
+            ledger=ledger,
             embedder=embedder,
             grader=build_sub_question_grader(settings),
             qualifier=build_alert_qualifier(settings),

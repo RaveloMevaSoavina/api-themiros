@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     openai_timeout_seconds: float = Field(default=30, gt=0, le=300)
     openai_input_cost_eur_per_million: Decimal = Field(default=Decimal("0"), ge=0)
     openai_output_cost_eur_per_million: Decimal = Field(default=Decimal("0"), ge=0)
+    # Embeddings (`ingestion_embedding_model`) : un seul tarif, en entrée.
+    openai_embedding_cost_eur_per_million: Decimal = Field(default=Decimal("0"), ge=0)
     ai_max_cost_eur: Decimal = Field(default=Decimal("0"), ge=0)
 
     # E4 — ingestion documentaire. Les seuils métier (70/40, bonus, malus)

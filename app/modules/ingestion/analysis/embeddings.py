@@ -14,6 +14,7 @@ from app.core.config import Settings
 from app.core.errors import ApiError
 from app.modules.ingestion.analysis.segmenter import count_tokens
 from app.modules.ingestion.errors import IngestionError, embedding_unavailable
+from app.modules.usage.ledger import count_embedding
 
 RETRY_ATTEMPTS = 3
 # Limites de l'API embeddings : 2 048 entrées et 300 000 tokens par requête
@@ -213,6 +214,8 @@ class OpenAIEmbedder:
                 response = await self._client.embeddings.create(
                     model=self.model, dimensions=self._dimensions, input=batch
                 )
+                # Tokens facturés, lus dans la réponse (registre ai_usage).
+                count_embedding(response.usage.total_tokens if response.usage else 0)
                 return [l2_normalize(item.embedding) for item in response.data]
             except (
                 openai.APIConnectionError,

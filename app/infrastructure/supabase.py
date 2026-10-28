@@ -163,6 +163,15 @@ class SupabaseGateway:
         if not response.is_success:
             raise self._service_error(response)
 
+    async def service_insert(self, path: str, *, payload: dict | list[dict]) -> None:
+        headers = self._service_headers()
+        headers["Prefer"] = "return=minimal"
+        response = await self._client.post(
+            self._rest_url(path), json=payload, headers=headers, timeout=15
+        )
+        if not response.is_success:
+            raise self._service_error(response)
+
     async def service_rpc(
         self, function_name: str, *, payload: dict, request_timeout: float = 30
     ) -> Any:

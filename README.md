@@ -110,6 +110,25 @@ The thresholds and `ENGINE_VERSION` are stored in each run's `rules_applied`.
 A run whose corpus classification is still pending is deferred
 (`RUN_DEFER_SECONDS`) for at most `RUN_CLASSIFICATION_WAIT_SECONDS`.
 
+## AI usage
+
+Every OpenAI call is recorded in `ai_usage` (migration
+`20261028000002_ai_usage.sql`) with the tokens billed, as returned by the API,
+and its cost: one row per document (`ingestion`), validated framework
+(`classification`), run step (`layer_b_search`, `layer_b`, `layer_c`,
+`restitution`) and framework generation (`pillar_generation`, written by a
+database trigger). `app/modules/usage/ledger.py` holds the ledger; embeddings
+are counted by `OpenAIEmbedder` in a per-task meter, so concurrent documents
+keep separate counts. Failed work is still recorded, since successful calls
+are billed, and a recording failure never fails the work.
+
+Costs use `OPENAI_INPUT_COST_EUR_PER_MILLION`,
+`OPENAI_OUTPUT_COST_EUR_PER_MILLION` and
+`OPENAI_EMBEDDING_COST_EUR_PER_MILLION` at call time (0 when unset). Cached
+input tokens are priced as regular input, so costs are slightly overstated
+when OpenAI's prompt cache applies. The dashboard reads the totals through
+`workspace_ai_usage` (Settings › General › AI usage).
+
 ## Run exports (E14)
 
 `POST /api/v1/exports/{run_id}/{pdf|docx|xlsx|csv}` (body:

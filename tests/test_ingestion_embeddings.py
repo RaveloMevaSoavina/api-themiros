@@ -1,4 +1,5 @@
 import math
+from uuid import uuid4
 
 import pytest
 
@@ -12,6 +13,7 @@ from app.modules.ingestion.analysis.embeddings import (
     token_batches,
 )
 from app.modules.ingestion.errors import is_retryable
+from app.modules.usage.ledger import UsageLedger
 
 
 class FakeModel:
@@ -126,12 +128,18 @@ async def test_openai_embedder_keeps_input_order_across_batches(monkeypatch):
                 type("Item", (), {"embedding": [float(int(text)), 1.0, 0.0]})
                 for text in input
             ]
-            return type("Response", (), {"data": data})
+            usage = type("Usage", (), {"total_tokens": 10 * len(input)})
+            return type("Response", (), {"data": data, "usage": usage})
 
     client = type("Client", (), {"embeddings": FakeEmbeddings()})()
     embedder = OpenAIEmbedder(settings(), client=client)
 
-    vectors = await embedder.embed(["1", "2", "3", "4", "5"])
+    # Les lots partent en parallèle et partagent le compteur du contexte.
+    async with UsageLedger(None, settings()).embeddings(
+        workspace_id=uuid4(), source="ingestion", model=embedder.model
+    ) as meter:
+        vectors = await embedder.embed(["1", "2", "3", "4", "5"])
 
     assert len(calls) == 3
     assert [round(vector[0] / vector[1]) for vector in vectors] == [1, 2, 3, 4, 5]
+    assert (meter.calls, meter.tokens) == (3, 50)

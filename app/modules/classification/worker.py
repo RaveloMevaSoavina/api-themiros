@@ -16,6 +16,7 @@ from app.modules.classification.repository import (
     ClassificationRepository,
 )
 from app.modules.ingestion.analysis.embeddings import Embedder
+from app.modules.usage.ledger import UsageLedger
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +29,12 @@ class ClassificationWorker:
         settings: Settings,
         *,
         worker_id: str,
+        ledger: UsageLedger | None = None,
     ) -> None:
         self._repository = repository
         self._embedder = embedder
         self._settings = settings
+        self._ledger = ledger or UsageLedger(None, settings)
         self._worker_id = f"{worker_id}#classification"
         self._stopping = asyncio.Event()
 
@@ -63,7 +66,14 @@ class ClassificationWorker:
 
     async def process(self, job: ClaimedFramework) -> None:
         try:
-            vectors = await self._embedder.embed([probe.text for probe in job.probes])
+            async with self._ledger.embeddings(
+                workspace_id=job.workspace_id,
+                source="classification",
+                model=self._embedder.model,
+            ):
+                vectors = await self._embedder.embed(
+                    [probe.text for probe in job.probes]
+                )
             result = await self._repository.complete(
                 job, self._embedder.model, list(zip(job.probes, vectors, strict=True))
             )

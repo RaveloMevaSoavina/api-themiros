@@ -23,6 +23,7 @@ from app.modules.ingestion.schemas import (
     SegmentResponse,
 )
 from app.modules.ingestion.service import IngestionService
+from app.modules.usage.ledger import UsageLedger
 
 router = APIRouter(prefix="/ingestion", tags=["ingestion"])
 jobs_router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -39,6 +40,7 @@ def get_ingestion_service(
         build_embedder(settings),
         get_country_detector(settings.ingestion_ner_model),
         settings,
+        UsageLedger(gateway, settings),
     )
     return IngestionService(gateway, repository, pipeline, settings)
 

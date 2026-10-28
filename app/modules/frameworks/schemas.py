@@ -96,6 +96,9 @@ class GeneratePillarsResponse(BaseModel):
     rationale: str = Field(min_length=1)
     prompt_version: str
     tokens_used: int = Field(ge=0)
+    # Détail facturé (registre ai_usage) ; tokens_used en reste la somme.
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
     cost_eur: Decimal = Field(ge=0, decimal_places=6)
     model: str
     duration_ms: int = Field(ge=0)
