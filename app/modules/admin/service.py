@@ -166,6 +166,15 @@ class ProfileService:
                 await self._repository.restore_profile(profile_id, token=user.token)
             raise
 
+    async def delete(self, profile_id: UUID, user: CurrentUser) -> None:
+        """Suppression définitive : la base vérifie que le compte n'est
+        l'auteur d'aucune donnée (sinon PROFILE_HAS_RECORDS : il s'archive)
+        et efface ses invitations, puis GoTrue supprime le compte ; le
+        profil et ses appartenances suivent en cascade."""
+        await require_platform_admin(self._repository, user)
+        await self._repository.prepare_profile_deletion(profile_id, token=user.token)
+        await self._repository.delete_user(str(profile_id))
+
     async def restore(self, profile_id: UUID, user: CurrentUser) -> None:
         # Débloquer d'abord : si GoTrue échoue, le profil reste archivé, ce
         # qui correspond à l'état réel du compte.

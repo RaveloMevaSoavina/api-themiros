@@ -305,7 +305,7 @@ class SupabaseGateway:
             raise ApiError(
                 status_code=503,
                 code="USER_DELETE_FAILED",
-                detail="Supabase n'a pas pu supprimer le compte invité",
+                detail="Supabase n'a pas pu supprimer le compte",
                 context={"upstream_status": response.status_code},
             )
 

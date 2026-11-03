@@ -66,6 +66,22 @@ async def archive_profile(
     return Response(status_code=204)
 
 
+# POST et non DELETE : le CORS de l'API n'autorise que GET et POST.
+@router.post(
+    "/profiles/{profile_id}/delete",
+    status_code=204,
+    responses={409: {"description": "The account authored data: archive it"}},
+)
+async def delete_profile(
+    profile_id: UUID,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ProfileService, Depends(get_profile_service)],
+) -> Response:
+    """Supprime définitivement un compte qui n'a produit aucune donnée."""
+    await service.delete(profile_id, user)
+    return Response(status_code=204)
+
+
 @router.post("/profiles/{profile_id}/restore", status_code=204)
 async def restore_profile(
     profile_id: UUID,

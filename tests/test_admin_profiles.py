@@ -41,11 +41,14 @@ class FakeRepository:
         email_taken: bool = False,
         member_fails: bool = False,
         ban_fails: bool = False,
+        has_records: bool = False,
     ) -> None:
         self._admin = admin
         self._email_taken = email_taken
         self._member_fails = member_fails
         self._ban_fails = ban_fails
+        self._has_records = has_records
+        self.prepared: list[UUID] = []
         self.archived: list[UUID] = []
         self.restored: list[UUID] = []
         self.bans: list[tuple[UUID, bool]] = []
@@ -93,6 +96,11 @@ class FakeRepository:
 
     async def restore_profile(self, profile_id, *, token):
         self.restored.append(profile_id)
+
+    async def prepare_profile_deletion(self, profile_id, *, token):
+        if self._has_records:
+            raise ApiError(status_code=409, code="PROFILE_HAS_RECORDS", detail="x")
+        self.prepared.append(profile_id)
 
     async def set_banned(self, user_id, *, banned):
         if self._ban_fails:
@@ -253,3 +261,36 @@ def test_archiving_is_reserved_to_platform_admins() -> None:
     assert response.status_code == 403
     assert repository.archived == []
     assert repository.bans == []
+
+
+async def test_deleting_an_unused_account_removes_it() -> None:
+    repository = FakeRepository()
+
+    await ProfileService(repository).delete(UUID(NEW_USER_ID), ADMIN)
+
+    assert repository.prepared == [UUID(NEW_USER_ID)]
+    assert repository.deleted_users == [NEW_USER_ID]
+
+
+async def test_an_account_with_records_is_not_deleted() -> None:
+    repository = FakeRepository(has_records=True)
+
+    with pytest.raises(ApiError) as error:
+        await ProfileService(repository).delete(UUID(NEW_USER_ID), ADMIN)
+
+    assert error.value.code == "PROFILE_HAS_RECORDS"
+    assert repository.deleted_users == []
+
+
+def test_deleting_is_reserved_to_platform_admins() -> None:
+    repository = FakeRepository(admin=False)
+    app.dependency_overrides[get_current_user] = lambda: ADMIN
+    app.dependency_overrides[get_profile_service] = lambda: ProfileService(repository)
+    try:
+        with TestClient(app) as client:
+            response = client.post(f"/api/v1/admin/profiles/{NEW_USER_ID}/delete")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 403
+    assert repository.deleted_users == []

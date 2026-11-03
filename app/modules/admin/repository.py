@@ -131,6 +131,13 @@ class AdminRepository:
             payload={"p_profile_id": str(profile_id)},
         )
 
+    async def prepare_profile_deletion(self, profile_id: UUID, *, token: str) -> None:
+        await self._gateway.rpc_value(
+            "backoffice_prepare_profile_deletion",
+            token=token,
+            payload={"p_profile_id": str(profile_id)},
+        )
+
     async def set_banned(self, user_id: UUID, *, banned: bool) -> None:
         await self._gateway.auth_set_banned(str(user_id), banned=banned)
 
