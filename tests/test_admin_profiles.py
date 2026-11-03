@@ -40,10 +40,15 @@ class FakeRepository:
         admin: bool = True,
         email_taken: bool = False,
         member_fails: bool = False,
+        ban_fails: bool = False,
     ) -> None:
         self._admin = admin
         self._email_taken = email_taken
         self._member_fails = member_fails
+        self._ban_fails = ban_fails
+        self.archived: list[UUID] = []
+        self.restored: list[UUID] = []
+        self.bans: list[tuple[UUID, bool]] = []
         self.created: list[dict] = []
         self.profiles: list[dict] = []
         self.members: list[tuple[UUID, str]] = []
@@ -82,6 +87,17 @@ class FakeRepository:
 
     async def delete_user(self, user_id):
         self.deleted_users.append(user_id)
+
+    async def archive_profile(self, profile_id, *, token):
+        self.archived.append(profile_id)
+
+    async def restore_profile(self, profile_id, *, token):
+        self.restored.append(profile_id)
+
+    async def set_banned(self, user_id, *, banned):
+        if self._ban_fails:
+            raise ApiError(status_code=503, code="USER_BAN_FAILED", detail="x")
+        self.bans.append((user_id, banned))
 
 
 async def test_the_account_joins_the_organization_and_its_workspaces() -> None:
@@ -184,3 +200,56 @@ def test_a_short_password_is_rejected_before_anything_is_created() -> None:
 
     assert response.status_code == 422
     assert repository.created == []
+
+
+async def test_archiving_bans_the_account() -> None:
+    repository = FakeRepository()
+
+    await ProfileService(repository).archive(UUID(NEW_USER_ID), ADMIN)
+
+    assert repository.archived == [UUID(NEW_USER_ID)]
+    assert repository.bans == [(UUID(NEW_USER_ID), True)]
+    assert repository.restored == []
+
+
+async def test_an_account_that_cannot_be_banned_is_not_shown_archived() -> None:
+    repository = FakeRepository(ban_fails=True)
+
+    with pytest.raises(ApiError) as error:
+        await ProfileService(repository).archive(UUID(NEW_USER_ID), ADMIN)
+
+    assert error.value.code == "USER_BAN_FAILED"
+    assert repository.restored == [UUID(NEW_USER_ID)]
+
+
+async def test_restoring_unbans_before_clearing_the_archive() -> None:
+    repository = FakeRepository()
+
+    await ProfileService(repository).restore(UUID(NEW_USER_ID), ADMIN)
+
+    assert repository.bans == [(UUID(NEW_USER_ID), False)]
+    assert repository.restored == [UUID(NEW_USER_ID)]
+
+
+async def test_a_failed_unban_leaves_the_profile_archived() -> None:
+    repository = FakeRepository(ban_fails=True)
+
+    with pytest.raises(ApiError):
+        await ProfileService(repository).restore(UUID(NEW_USER_ID), ADMIN)
+
+    assert repository.restored == []
+
+
+def test_archiving_is_reserved_to_platform_admins() -> None:
+    repository = FakeRepository(admin=False)
+    app.dependency_overrides[get_current_user] = lambda: ADMIN
+    app.dependency_overrides[get_profile_service] = lambda: ProfileService(repository)
+    try:
+        with TestClient(app) as client:
+            response = client.post(f"/api/v1/admin/profiles/{NEW_USER_ID}/archive")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 403
+    assert repository.archived == []
+    assert repository.bans == []

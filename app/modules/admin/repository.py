@@ -117,6 +117,23 @@ class AdminRepository:
             },
         )
 
+    async def archive_profile(self, profile_id: UUID, *, token: str) -> None:
+        await self._gateway.rpc_value(
+            "backoffice_archive_profile",
+            token=token,
+            payload={"p_profile_id": str(profile_id)},
+        )
+
+    async def restore_profile(self, profile_id: UUID, *, token: str) -> None:
+        await self._gateway.rpc_value(
+            "backoffice_restore_profile",
+            token=token,
+            payload={"p_profile_id": str(profile_id)},
+        )
+
+    async def set_banned(self, user_id: UUID, *, banned: bool) -> None:
+        await self._gateway.auth_set_banned(str(user_id), banned=banned)
+
     async def set_workspace_member(
         self, workspace_id: UUID, profile_id: str, *, role: str, token: str
     ) -> None:

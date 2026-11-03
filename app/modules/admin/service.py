@@ -110,7 +110,9 @@ class InvitationService:
 
 
 class ProfileService:
-    """Création manuelle d'un compte, sans e-mail : GoTrue crée le compte
+    """Création manuelle et archivage d'un compte.
+
+    Création, sans e-mail : GoTrue crée le compte
     (adresse confirmée, mot de passe choisi par l'administrateur) et
     handle_new_user son profil, puis les fonctions backoffice_* le rattachent
     à l'organisation et aux espaces. Si le rattachement échoue, le compte est
@@ -149,6 +151,27 @@ class ProfileService:
                 await self._repository.delete_user(profile_id)
             raise
         return ProfileCreateResult(id=UUID(profile_id))
+
+    async def archive(self, profile_id: UUID, user: CurrentUser) -> None:
+        """La base enregistre l'archivage (et refuse de s'archiver soi-même),
+        puis GoTrue bannit le compte. Sans bannissement, l'archivage est
+        annulé : le backoffice ne montre pas archivé un compte qui se
+        connecte encore."""
+        await require_platform_admin(self._repository, user)
+        await self._repository.archive_profile(profile_id, token=user.token)
+        try:
+            await self._repository.set_banned(profile_id, banned=True)
+        except ApiError:
+            with suppress(ApiError):
+                await self._repository.restore_profile(profile_id, token=user.token)
+            raise
+
+    async def restore(self, profile_id: UUID, user: CurrentUser) -> None:
+        # Débloquer d'abord : si GoTrue échoue, le profil reste archivé, ce
+        # qui correspond à l'état réel du compte.
+        await require_platform_admin(self._repository, user)
+        await self._repository.set_banned(profile_id, banned=False)
+        await self._repository.restore_profile(profile_id, token=user.token)
 
 
 async def require_platform_admin(

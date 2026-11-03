@@ -55,6 +55,27 @@ async def create_profile(
     return await service.create(payload, user)
 
 
+@router.post("/profiles/{profile_id}/archive", status_code=204)
+async def archive_profile(
+    profile_id: UUID,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ProfileService, Depends(get_profile_service)],
+) -> Response:
+    """Archive un compte : il ne peut plus se connecter, rien n'est effacé."""
+    await service.archive(profile_id, user)
+    return Response(status_code=204)
+
+
+@router.post("/profiles/{profile_id}/restore", status_code=204)
+async def restore_profile(
+    profile_id: UUID,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ProfileService, Depends(get_profile_service)],
+) -> Response:
+    await service.restore(profile_id, user)
+    return Response(status_code=204)
+
+
 @router.post(
     "/invitations",
     response_model=InvitationResult,

@@ -275,6 +275,24 @@ class SupabaseGateway:
             )
         return response.json()
 
+    async def auth_set_banned(self, user_id: str, *, banned: bool) -> None:
+        """Bannir empêche la connexion et le renouvellement de session ; le
+        jeton déjà délivré reste valable jusqu'à son expiration."""
+        response = await self._client.put(
+            self._auth_url(f"admin/users/{user_id}"),
+            # GoTrue n'a pas de bannissement sans fin : 100 ans.
+            json={"ban_duration": "876000h" if banned else "none"},
+            headers=self._service_headers(),
+            timeout=15,
+        )
+        if not response.is_success:
+            raise ApiError(
+                status_code=503,
+                code="USER_BAN_FAILED",
+                detail="Supabase n'a pas pu bloquer ou débloquer le compte",
+                context={"upstream_status": response.status_code},
+            )
+
     async def auth_delete_user(self, user_id: str) -> None:
         response = await self._client.delete(
             self._auth_url(f"admin/users/{user_id}"),
