@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_service_role_key: str | None = Field(default=None, repr=False)
     supabase_jwt_audience: str = "authenticated"
+    # Backoffice : page du dashboard où mène le lien d'une invitation. Vide :
+    # le Site URL de Supabase Auth.
+    invitation_redirect_url: str | None = None
     ai_provider: Literal["disabled", "openai"] = "disabled"
     openai_api_key: str | None = Field(default=None, repr=False)
     openai_model: str = "gpt-6-astra"

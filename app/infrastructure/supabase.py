@@ -215,6 +215,67 @@ class SupabaseGateway:
             )
         return response.content
 
+    async def auth_invite(
+        self, email: str, *, data: dict, redirect_to: str | None
+    ) -> dict | None:
+        """Invitation GoTrue : crée le compte s'il n'existe pas et envoie le
+        lien. None quand un compte confirmé porte déjà cette adresse."""
+        response = await self._client.post(
+            self._auth_url("invite"),
+            params={"redirect_to": redirect_to} if redirect_to else None,
+            json={"email": email, "data": data},
+            headers=self._service_headers(),
+            timeout=15,
+        )
+        if response.status_code == 422 and self._email_exists(response):
+            return None
+        if not response.is_success:
+            raise ApiError(
+                status_code=503,
+                code="INVITATION_EMAIL_FAILED",
+                detail="Supabase n'a pas pu envoyer l'e-mail d'invitation",
+                context={"upstream_status": response.status_code},
+            )
+        return response.json()
+
+    async def auth_delete_user(self, user_id: str) -> None:
+        response = await self._client.delete(
+            self._auth_url(f"admin/users/{user_id}"),
+            headers=self._service_headers(),
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return
+        if not response.is_success:
+            raise ApiError(
+                status_code=503,
+                code="USER_DELETE_FAILED",
+                detail="Supabase n'a pas pu supprimer le compte invité",
+                context={"upstream_status": response.status_code},
+            )
+
+    @staticmethod
+    def _email_exists(response: httpx.Response) -> bool:
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        if not isinstance(body, dict):
+            return False
+        message = str(body.get("msg") or body.get("message") or "")
+        return body.get("error_code") == "email_exists" or (
+            "already been registered" in message
+        )
+
+    def _auth_url(self, path: str) -> str:
+        if not self._settings.supabase_url:
+            raise ApiError(
+                status_code=503,
+                code="DATABASE_NOT_CONFIGURED",
+                detail="Supabase n'est pas configuré côté API",
+            )
+        return f"{self._settings.supabase_url.rstrip('/')}/auth/v1/{path.lstrip('/')}"
+
     def _service_headers(self) -> dict[str, str]:
         if not self._settings.supabase_service_role_key:
             raise ApiError(
