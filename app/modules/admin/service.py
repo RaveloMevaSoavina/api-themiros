@@ -14,7 +14,13 @@ from uuid import UUID
 from app.api.dependencies import CurrentUser
 from app.core.errors import ApiError
 from app.modules.admin.repository import AdminRepository
-from app.modules.admin.schemas import Delivery, InvitationRequest, InvitationResult
+from app.modules.admin.schemas import (
+    Delivery,
+    InvitationRequest,
+    InvitationResult,
+    ProfileCreateRequest,
+    ProfileCreateResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +106,57 @@ class InvitationService:
         return "attached"
 
     async def _require_platform_admin(self, user: CurrentUser) -> None:
-        if not await self._repository.is_platform_admin(token=user.token):
-            raise ApiError(
-                status_code=403,
-                code="PLATFORM_ADMIN_REQUIRED",
-                detail="Réservé aux administrateurs de la plateforme",
+        await require_platform_admin(self._repository, user)
+
+
+class ProfileService:
+    """Création manuelle d'un compte, sans e-mail : GoTrue crée le compte
+    (adresse confirmée, mot de passe choisi par l'administrateur) et
+    handle_new_user son profil, puis les fonctions backoffice_* le rattachent
+    à l'organisation et aux espaces. Si le rattachement échoue, le compte est
+    supprimé : il n'en reste pas un sans organisation."""
+
+    def __init__(self, repository: AdminRepository) -> None:
+        self._repository = repository
+
+    async def create(
+        self, request: ProfileCreateRequest, user: CurrentUser
+    ) -> ProfileCreateResult:
+        await require_platform_admin(self._repository, user)
+        email = request.email.strip().lower()
+        full_name = (request.full_name or "").strip() or None
+        profile_id = await self._repository.create_user(
+            email, password=request.password, full_name=full_name
+        )
+        try:
+            await self._repository.update_profile(
+                profile_id,
+                # Même repli que handle_new_user quand le nom manque.
+                full_name=full_name or email.split("@", 1)[0],
+                role=request.role,
+                organization_id=request.organization_id,
+                token=user.token,
             )
+            for workspace_id in dict.fromkeys(request.workspace_ids):
+                await self._repository.set_workspace_member(
+                    workspace_id,
+                    profile_id,
+                    role=request.workspace_role,
+                    token=user.token,
+                )
+        except ApiError:
+            with suppress(ApiError):
+                await self._repository.delete_user(profile_id)
+            raise
+        return ProfileCreateResult(id=UUID(profile_id))
+
+
+async def require_platform_admin(
+    repository: AdminRepository, user: CurrentUser
+) -> None:
+    if not await repository.is_platform_admin(token=user.token):
+        raise ApiError(
+            status_code=403,
+            code="PLATFORM_ADMIN_REQUIRED",
+            detail="Réservé aux administrateurs de la plateforme",
+        )

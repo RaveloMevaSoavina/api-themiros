@@ -2,8 +2,8 @@
 
 Les fonctions backoffice_* s'appellent avec le jeton de l'administrateur :
 elles vérifient elles-mêmes qu'il administre la plateforme. Seuls le
-rattachement d'un compte invité et l'envoi de l'e-mail passent par la clé
-serveur.
+rattachement d'un compte invité, l'envoi de l'e-mail, la création et la
+suppression d'un compte passent par la clé serveur.
 """
 
 from typing import Any
@@ -85,3 +85,47 @@ class AdminRepository:
 
     async def delete_user(self, user_id: str) -> None:
         await self._gateway.auth_delete_user(user_id)
+
+    async def create_user(
+        self, email: str, *, password: str, full_name: str | None
+    ) -> str:
+        data: dict[str, str] = {"lang": "fr"}
+        if full_name:
+            data["full_name"] = full_name
+        created = await self._gateway.auth_create_user(
+            email, password=password, data=data
+        )
+        return str(created["id"])
+
+    async def update_profile(
+        self,
+        profile_id: str,
+        *,
+        full_name: str,
+        role: str,
+        organization_id: UUID,
+        token: str,
+    ) -> None:
+        await self._gateway.rpc_value(
+            "backoffice_update_profile",
+            token=token,
+            payload={
+                "p_profile_id": profile_id,
+                "p_full_name": full_name,
+                "p_role": role,
+                "p_organization_id": str(organization_id),
+            },
+        )
+
+    async def set_workspace_member(
+        self, workspace_id: UUID, profile_id: str, *, role: str, token: str
+    ) -> None:
+        await self._gateway.rpc_value(
+            "backoffice_set_workspace_member",
+            token=token,
+            payload={
+                "p_workspace_id": str(workspace_id),
+                "p_profile_id": profile_id,
+                "p_role": role,
+            },
+        )

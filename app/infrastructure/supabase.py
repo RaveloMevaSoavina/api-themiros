@@ -238,6 +238,43 @@ class SupabaseGateway:
             )
         return response.json()
 
+    async def auth_create_user(self, email: str, *, password: str, data: dict) -> dict:
+        """Compte créé par un administrateur : adresse confirmée d'office, aucun
+        e-mail envoyé."""
+        response = await self._client.post(
+            self._auth_url("admin/users"),
+            json={
+                "email": email,
+                "password": password,
+                "email_confirm": True,
+                "user_metadata": data,
+            },
+            headers=self._service_headers(),
+            timeout=15,
+        )
+        if response.status_code == 422 and self._email_exists(response):
+            raise ApiError(
+                status_code=409,
+                code="EMAIL_ALREADY_REGISTERED",
+                detail="Un compte existe déjà avec cette adresse",
+            )
+        if response.status_code == 422 and self._error_code(response) == (
+            "weak_password"
+        ):
+            raise ApiError(
+                status_code=422,
+                code="WEAK_PASSWORD",
+                detail="Mot de passe refusé par Supabase Auth : trop faible",
+            )
+        if not response.is_success:
+            raise ApiError(
+                status_code=503,
+                code="USER_CREATE_FAILED",
+                detail="Supabase n'a pas pu créer le compte",
+                context={"upstream_status": response.status_code},
+            )
+        return response.json()
+
     async def auth_delete_user(self, user_id: str) -> None:
         response = await self._client.delete(
             self._auth_url(f"admin/users/{user_id}"),
@@ -255,13 +292,20 @@ class SupabaseGateway:
             )
 
     @staticmethod
-    def _email_exists(response: httpx.Response) -> bool:
+    def _auth_error_body(response: httpx.Response) -> dict:
         try:
             body = response.json()
         except ValueError:
-            return False
-        if not isinstance(body, dict):
-            return False
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    @classmethod
+    def _error_code(cls, response: httpx.Response) -> str:
+        return str(cls._auth_error_body(response).get("error_code") or "")
+
+    @classmethod
+    def _email_exists(cls, response: httpx.Response) -> bool:
+        body = cls._auth_error_body(response)
         message = str(body.get("msg") or body.get("message") or "")
         return body.get("error_code") == "email_exists" or (
             "already been registered" in message

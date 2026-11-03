@@ -8,8 +8,13 @@ from app.api.dependencies import CurrentUser, get_current_user
 from app.core.config import Settings, get_settings
 from app.infrastructure.supabase import SupabaseGateway
 from app.modules.admin.repository import AdminRepository
-from app.modules.admin.schemas import InvitationRequest, InvitationResult
-from app.modules.admin.service import InvitationService
+from app.modules.admin.schemas import (
+    InvitationRequest,
+    InvitationResult,
+    ProfileCreateRequest,
+    ProfileCreateResult,
+)
+from app.modules.admin.service import InvitationService, ProfileService
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -22,6 +27,32 @@ def get_invitation_service(
         AdminRepository(SupabaseGateway(settings, client)),
         redirect_to=settings.invitation_redirect_url,
     )
+
+
+def get_profile_service(
+    request: Request, settings: Annotated[Settings, Depends(get_settings)]
+) -> ProfileService:
+    client: httpx.AsyncClient = request.app.state.http_client
+    return ProfileService(AdminRepository(SupabaseGateway(settings, client)))
+
+
+@router.post(
+    "/profiles",
+    response_model=ProfileCreateResult,
+    status_code=201,
+    responses={
+        401: {"description": "Missing or invalid Supabase JWT"},
+        403: {"description": "Not a platform administrator"},
+        409: {"description": "An account already uses this address"},
+    },
+)
+async def create_profile(
+    payload: ProfileCreateRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ProfileService, Depends(get_profile_service)],
+) -> ProfileCreateResult:
+    """Crée un compte avec mot de passe, sans e-mail, dans une organisation."""
+    return await service.create(payload, user)
 
 
 @router.post(
