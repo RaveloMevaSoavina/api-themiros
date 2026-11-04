@@ -43,11 +43,19 @@ class GradingUnavailable(Exception):
 
 
 # Schéma de sortie compact : identifiants courts, une lettre par champ.
+class LlmReading(BaseModel):
+    """Interprétation d'un extrait : son identifiant e, le texte t."""
+
+    e: str
+    t: str
+
+
 class LlmGrade(BaseModel):
     k: str
     n: int | None
     e: list[str]
     c: bool
+    i: list[LlmReading]
 
 
 class LlmCriterionJustification(BaseModel):
@@ -110,12 +118,15 @@ class LlmRestitutionTranslation(BaseModel):
     i: list[LlmTranslatedItem]
     c: str
     a: list[LlmTranslatedAction]
+    x: list[LlmTranslatedItem]
 
 
 class LlmRestitutionOutput(BaseModel):
     i: list[LlmRestitutionItem]
     c: str
     a: list[LlmRestitutionAction]
+    # Interprétation de chaque extrait (k : son identifiant).
+    x: list[LlmTranslatedItem]
     tr: list[LlmRestitutionTranslation]
 
 
@@ -269,7 +280,14 @@ class OpenAISubQuestionGrader(OpenAIStructuredCall):
         return (
             RawGrading(
                 grades=tuple(
-                    RawGrade(item.k, item.n, tuple(item.e), item.c) for item in parsed.q
+                    RawGrade(
+                        item.k,
+                        item.n,
+                        tuple(item.e),
+                        item.c,
+                        {reading.e: reading.t for reading in item.i},
+                    )
+                    for item in parsed.q
                 ),
                 justifications={item.k: item.j for item in parsed.c},
             ),
@@ -316,6 +334,7 @@ class OpenAIRestitutionWriter(OpenAIStructuredCall):
                     RawItem(item.k, item.t, tuple(item.e)) for item in parsed.i
                 ),
                 conclusion=parsed.c,
+                readings={item.k: item.t for item in parsed.x},
                 actions=tuple(
                     RawAction(
                         item.k,
@@ -333,6 +352,7 @@ class OpenAIRestitutionWriter(OpenAIStructuredCall):
                     translation.l: RawTranslation(
                         items={item.k: item.t for item in translation.i},
                         conclusion=translation.c,
+                        readings={item.k: item.t for item in translation.x},
                         actions={
                             item.k: {
                                 persona: RawProjection(

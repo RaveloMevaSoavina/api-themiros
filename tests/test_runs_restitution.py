@@ -1,5 +1,6 @@
 from uuid import UUID, uuid4
 
+from app.modules.runs.citations import Source
 from app.modules.runs.domain import LayerAResults, Match, PillarScore, VariableResult
 from app.modules.runs.layer_b import (
     Candidate,
@@ -316,7 +317,10 @@ def test_every_candidate_goes_in_one_compact_ai_call() -> None:
     assert content["l"] == {"nc": 1, "tc": 2, "cf": 0.8, "ld": False}
     # Un extrait cité par plusieurs candidats n'est envoyé qu'une fois, tronqué.
     assert len(content["x"]) == 4
-    assert all(len(text) <= RULES.excerpt_chars for text in content["x"].values())
+    assert all(
+        sum(len(sentence) for sentence in sentences) <= RULES.excerpt_chars
+        for sentences in content["x"].values()
+    )
     assert content["v"][0]["e"] == ["E2", "E1"]
     assert batch.estimated_input_tokens > 0 and batch.max_output_tokens > 0
 
@@ -522,3 +526,89 @@ def test_english_labels_follow_the_approach_locale() -> None:
     assert restitution.items("faiblesse")[0].text == (
         "Suivi-évaluation: 20/100 (corpus confidence 80%)."
     )
+
+
+def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
+    restitution, batch, alert = _full_restitution()
+    budget = batch.excerpts["E1"]
+    raw = RawRestitution(
+        items=(
+            RawItem("P1", "L'exécution progresse [E1.2, E3].", ()),
+            RawItem("V1", "Écart à vérifier [E2, E1].", ("E2",)),
+        ),
+        conclusion=(
+            "L'exécution atteint 85 % [E1.1, E4].\n\nLe suivi reste manuel [E2, E9]."
+        ),
+        actions=(
+            RawAction(
+                "V1",
+                (),
+                {
+                    persona: RawProjection(
+                        "Vérifier l'écart.", "les besoins ne sont pas analysés [E2]"
+                    )
+                    for persona in ("decideur", "pmu", "analyste")
+                },
+            ),
+        ),
+        readings={"E1": "Le taux d'exécution budgétaire est élevé.", "E9": "?"},
+        translations={
+            "en": RawTranslation(
+                items={"P1": "Execution improves [E1.2]."},
+                conclusion="Execution reaches 85% [E4, E1.1].\n\nMonitoring [E2].",
+                actions={},
+                readings={"E1": "The budget execution rate is high."},
+            )
+        },
+    )
+
+    interpret(restitution, batch, raw)
+
+    progress = restitution.items("progres")[0]
+    # E3 n'est pas proposé pour ce constat : seule E1.2 est sa source.
+    assert progress.text == "L'exécution progresse⟦1⟧."
+    assert progress.translations == {"en": "Execution improves⟦1⟧."}
+    assert progress.citations == [Source(BUDGET_SEGMENT, (budget.spans[1],))]
+    to_verify = restitution.items("a_verifier")[0]
+    assert to_verify.text == "Écart à vérifier⟦1,2⟧."
+    assert to_verify.segment_ids == [PERTINENCE_SEGMENT, BUDGET_SEGMENT]
+    # Paragraphes gardés ; mêmes numéros dans la traduction.
+    assert restitution.conclusion == (
+        "L'exécution atteint 85 %⟦1,2⟧.\n\nLe suivi reste manuel⟦3⟧."
+    )
+    assert restitution.conclusion_translations == {
+        "en": "Execution reaches 85%⟦2,1⟧.\n\nMonitoring⟦3⟧."
+    }
+    assert [source.segment_id for source in restitution.conclusion_citations] == [
+        BUDGET_SEGMENT,
+        IMPACT_SEGMENT,
+        PERTINENCE_SEGMENT,
+    ]
+    (action,) = restitution.actions
+    assert action.projections[0].justification == "les besoins ne sont pas analysés⟦1⟧"
+    assert action.segment_ids == [PERTINENCE_SEGMENT]
+    reading = restitution.readings[BUDGET_SEGMENT]
+    assert reading.text == "Le taux d'exécution budgétaire est élevé."
+    assert reading.translations == {"en": "The budget execution rate is high."}
+    # Phrases citées de l'extrait par tous les textes : V1 le cite entier.
+    assert reading.spans == ((budget.spans[0][0], budget.spans[-1][1]),)
+
+    payload = restitution.payload()
+    assert payload["items"][0]["citations"] == [
+        {"segment_id": str(BUDGET_SEGMENT), "spans": [list(budget.spans[1])]}
+    ]
+    assert len(payload["synthesis"]["citations"]) == 3
+    assert payload["actions"][0]["projections"][0]["citations"] == [
+        {
+            "segment_id": str(PERTINENCE_SEGMENT),
+            "spans": [list(batch.excerpts["E2"].spans[0])],
+        }
+    ]
+    assert payload["readings"] == [
+        {
+            "segment_id": str(BUDGET_SEGMENT),
+            "interpretation": "Le taux d'exécution budgétaire est élevé.",
+            "translations": {"en": "The budget execution rate is high."},
+            "spans": [[budget.spans[0][0], budget.spans[-1][1]]],
+        }
+    ]

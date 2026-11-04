@@ -139,7 +139,7 @@ async def test_empty_queue_does_nothing() -> None:
     repository = FakeRepository([], _inputs())
     assert await _worker(repository).run_once() is False
     assert repository.claims == [
-        ("host-1#runs", "layer-a/1.0.0+layer-b/1.0.0+layer-c/1.0.0+restitution/1.3.0")
+        ("host-1#runs", "layer-a/1.0.0+layer-b/1.1.0+layer-c/1.0.0+restitution/1.4.0")
     ]
 
 
@@ -315,7 +315,7 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     assert len(results["layer_b"]["evidences"]) == 2
     ai = results["rules"]["layer_b"]["ai"]
     assert ai["status"] == "completed" and ai["calls"] == 1
-    assert ai["prompt"] == "grade_sub_questions_v1.0"
+    assert ai["prompt"] == "grade_sub_questions_v1.1"
     assert (ai["input_tokens"], ai["output_tokens"]) == (1200, 80)
     summary = next(
         s for n, st, s in repository.steps if (n, st) == ("layer_b", "completed")
@@ -610,9 +610,9 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     ]
     assert all(len(action["projections"]) == 3 for action in restitution["actions"])
     rules = results["rules"]["restitution"]
-    assert rules["engine_version"] == "restitution/1.3.0"
+    assert rules["engine_version"] == "restitution/1.4.0"
     assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
-    assert rules["ai"]["prompt"] == "formulate_restitution_v1.2"
+    assert rules["ai"]["prompt"] == "formulate_restitution_v1.3"
     assert results["summary"]["actions"] == 2
     assert repository.failures == []
 
@@ -632,8 +632,10 @@ async def test_without_ai_the_synthesis_keeps_factual_labels() -> None:
         "status": "disabled",
         "locale": "fr",
         "translations": {},
+        "citations": [],
     }
     assert restitution["actions"] == []
+    assert restitution["readings"] == []
     ai = results["rules"]["restitution"]["ai"]
     assert ai["status"] == "unavailable" and ai["errors"] == ["AI_DISABLED"]
 

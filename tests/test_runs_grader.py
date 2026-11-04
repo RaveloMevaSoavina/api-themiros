@@ -16,6 +16,7 @@ from app.modules.runs.grader import (
     LlmGradingOutput,
     LlmProjection,
     LlmQualificationOutput,
+    LlmReading,
     LlmRestitutionAction,
     LlmRestitutionItem,
     LlmRestitutionOutput,
@@ -112,7 +113,15 @@ def _settings(**overrides) -> Settings:
 
 
 OUTPUT = LlmGradingOutput(
-    q=[LlmGrade(k="Q1", n=2, e=["E1"], c=False)],
+    q=[
+        LlmGrade(
+            k="Q1",
+            n=2,
+            e=["E1.1"],
+            c=False,
+            i=[LlmReading(e="E1", t="Le projet répond aux priorités.")],
+        )
+    ],
     c=[LlmCriterionJustification(k="C1", j="Besoins analysés.")],
 )
 
@@ -131,6 +140,8 @@ async def test_one_structured_call_returns_the_ratings_and_their_cost() -> None:
     assert request["input"][0]["content"] == "Noter les sous-questions."
     assert request["input"][1]["content"] == batch.message()
     assert raw.grades[0].key == "Q1" and raw.grades[0].note == 2
+    assert raw.grades[0].excerpts == ("E1.1",)
+    assert raw.grades[0].readings == {"E1": "Le projet répond aux priorités."}
     assert raw.justifications == {"C1": "Besoins analysés."}
     assert usage.cost_eur == Decimal("0.004800")
 
@@ -259,8 +270,10 @@ async def test_one_structured_call_writes_the_restitution() -> None:
                 i=[LlmTranslatedItem(k="V1", t="Gap to verify.")],
                 c="Results suggest a gap.",
                 a=[LlmTranslatedAction(k="V1", dec=english, pmu=english, ana=english)],
+                x=[LlmTranslatedItem(k="E1", t="The extract states a gap.")],
             )
         ],
+        x=[LlmTranslatedItem(k="E1", t="L'extrait établit un écart.")],
     )
     client = FakeOpenAI(output=output)
     prompt = {**PROMPT, "parameters": {"max_tokens": 3000}}
@@ -284,8 +297,10 @@ async def test_one_structured_call_writes_the_restitution() -> None:
     assert action.projections["analyste"] == RawProjection(
         "Vérifier l'écart.", "l'écart est majeur"
     )
+    assert raw.readings == {"E1": "L'extrait établit un écart."}
     translation = raw.translations["en"]
     assert translation.items == {"V1": "Gap to verify."}
+    assert translation.readings == {"E1": "The extract states a gap."}
     assert translation.conclusion == "Results suggest a gap."
     assert translation.actions["V1"]["pmu"] == RawProjection(
         "Check the gap.", "the gap is major"

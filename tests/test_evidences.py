@@ -192,3 +192,72 @@ def test_endpoint_serves_the_highlighted_pdf_inline() -> None:
     )
     assert repository.downloaded == ["ws/doc/rapport.pdf"]
     assert highlights(response.content)
+
+
+SECOND_SENTENCE = (
+    "Les responsables des institutions partenaires ont changé trois fois "
+    "depuis le lancement du programme."
+)
+TWO_SENTENCES = f"{PASSAGE} {SECOND_SENTENCE}"
+
+
+def test_only_the_cited_sentences_are_highlighted() -> None:
+    content = pdf([FILLER, TWO_SENTENCES, FILLER])
+    start = TWO_SENTENCES.index(SECOND_SENTENCE)
+
+    result = highlight(content, TWO_SENTENCES, 1, [[start, len(TWO_SENTENCES)]])
+
+    assert result.highlighted
+    [(page, text)] = highlights(result.content).items()
+    assert "responsables des institutions" in text
+    assert "comité de pilotage" not in text
+
+
+def test_sentences_not_found_leave_the_whole_excerpt_highlighted() -> None:
+    content = pdf([FILLER, PASSAGE])
+
+    # Positions hors de l'extrait : rien n'y tombe.
+    result = highlight(content, PASSAGE, 1, [[5000, 6000]])
+
+    assert result.highlighted
+    assert "comité de pilotage" in highlights(result.content)[1]
+
+
+def _get(path: str, repository: FakeRepository):
+    app.dependency_overrides[get_current_user] = lambda: USER
+    app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(repository)
+    try:
+        with TestClient(app) as client:
+            return client.get(path)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_endpoint_highlights_the_requested_sentences_or_the_cited_ones() -> None:
+    content = pdf([FILLER, TWO_SENTENCES])
+    start = TWO_SENTENCES.index(SECOND_SENTENCE)
+    row = {**evidence_row(), "excerpt": TWO_SENTENCES}
+
+    asked = _get(
+        f"/api/v1/evidences/{EVIDENCE_ID}/document?spans={start}-{len(TWO_SENTENCES)}",
+        FakeRepository(row, content=content),
+    )
+    stored = _get(
+        f"/api/v1/evidences/{EVIDENCE_ID}/document",
+        FakeRepository({**row, "spans": [[0, start - 1]]}, content=content),
+    )
+
+    assert asked.status_code == 200 and stored.status_code == 200
+    assert "comité de pilotage" not in highlights(asked.content)[1]
+    assert "responsables" not in highlights(stored.content)[1]
+    assert "comité de pilotage" in highlights(stored.content)[1]
+
+
+@pytest.mark.parametrize("spans", ["12", "a-b", "-4", ",".join(["0-1"] * 21)])
+def test_endpoint_rejects_malformed_spans(spans) -> None:
+    response = _get(
+        f"/api/v1/evidences/{EVIDENCE_ID}/document?spans={spans}",
+        FakeRepository(evidence_row(), content=pdf([PASSAGE])),
+    )
+
+    assert response.status_code == 422

@@ -20,13 +20,14 @@ Déroulé, pour un run :
    sont les faiblesses, les alertes et les critères non conclus documentés
    en partie ;
 2. `build_batch` : tous les candidats en un seul appel IA (prompt
-   formulate_restitution), extraits dédoublonnés et tronqués, identifiants
-   courts (P1, W1, V1, N1, E1). Le volume est borné par construction (neuf
-   puces, six actions) : jamais plus d'un appel ;
+   formulate_restitution), extraits dédoublonnés et découpés en phrases,
+   identifiants courts (P1, W1, V1, N1, E1). Le volume est borné par
+   construction (neuf puces, six actions) : jamais plus d'un appel ;
 3. `interpret` : l'IA rédige chaque puce, la conclusion prudente et chaque
-   action avec ses trois projections persona, en citant des extraits
-   proposés pour elle. Une action sans ses trois projections n'est pas
-   publiée (RG-4).
+   action avec ses trois projections persona, en citant dans le texte les
+   phrases des extraits proposés pour elle (`citations`), et interprète
+   chaque extrait en une phrase, lue à la place de l'extrait brut. Une
+   action sans ses trois projections n'est pas publiée (RG-4).
 
 Sans IA (désactivée, en erreur, plafond de coût), les puces sont publiées
 avec un libellé factuel, sans conclusion ni plan d'action : la synthèse
@@ -43,16 +44,31 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from app.modules.evidences.passages import Span, merge
 from app.modules.frameworks.schemas import INTERFACE_LOCALES
+from app.modules.runs.citations import (
+    Citations,
+    Excerpt,
+    Source,
+    cited,
+    compact,
+    cut,
+    excerpt,
+    fit,
+    plain,
+    references,
+)
+from app.modules.runs.citations import truncate as truncate_cited
 from app.modules.runs.domain import LayerAResults, PillarScore
 from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.layer_c import Alert, LayerCInputs, ordered_segments
 
-RESTITUTION_VERSION = "restitution/1.3.0"
+RESTITUTION_VERSION = "restitution/1.4.0"
 PROMPT_CODE = "formulate_restitution"
 # v1.2 : le même appel traduit aussi la restitution dans les autres langues
-# de l'interface (`tr`).
-PROMPT_VERSION = "v1.2"
+# de l'interface (`tr`). v1.3 : extraits en phrases, sources citées dans le
+# texte, interprétation de chaque extrait (`x`).
+PROMPT_VERSION = "v1.3"
 
 Section = Literal["progres", "faiblesse", "a_verifier"]
 # Rédaction de la synthèse : faite, inutile (aucun constat), IA désactivée,
@@ -69,11 +85,18 @@ SYSTEM_PROMPT_TOKENS = 900
 OUTPUT_TOKENS_PER_ITEM = 70
 OUTPUT_TOKENS_PER_ACTION = 650
 OUTPUT_TOKENS_CONCLUSION = 650
+OUTPUT_TOKENS_PER_READING = 60
 ITEM_CHARS = 240
 # Le prompt (v1.1) demande 1 800 caractères pour la conclusion et 300 pour
 # une action ou sa raison : ces plafonds ne coupent qu'un dépassement net.
 CONCLUSION_CHARS = 2400
 PROJECTION_CHARS = 450
+# Le prompt (v1.3) demande 160 caractères pour l'interprétation d'un extrait.
+READING_CHARS = 220
+# Plafonds de la base, marqueurs de sources compris.
+ITEM_MAX_CHARS = 300
+CONCLUSION_MAX_CHARS = 3000
+PROJECTION_MAX_CHARS = 600
 
 # « Recommandée parce que » est ajouté à l'affichage.
 BECAUSE = re.compile(
@@ -91,7 +114,8 @@ class RestitutionRules:
     poor_confidence: float = 0.5
     limits_from: int = 2
     evidences_per_item: int = 3
-    excerpt_chars: int = 300
+    # Assez de phrases pour que l'IA cite la bonne.
+    excerpt_chars: int = 600
     max_actions: int = 6
 
     def as_dict(self) -> dict[str, Any]:
@@ -116,6 +140,8 @@ class Finding:
     alert_id: UUID | None = None
     # Constat traduit, par langue de l'interface (autre que celle du run).
     translations: dict[str, str] = field(default_factory=dict)
+    # Sources numérotées du constat et de ses traductions (« ⟦1⟧ »).
+    citations: list[Source] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +151,25 @@ class Projection:
     justification: str
     # Langue -> {"text", "justification"}.
     translations: dict[str, dict[str, str]] = field(default_factory=dict)
+    citations: list[Source] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "persona": self.persona,
+            "text": self.text,
+            "justification": self.justification,
+            "translations": self.translations,
+            "citations": [source.as_dict() for source in self.citations],
+        }
+
+
+@dataclass(slots=True)
+class Reading:
+    """Interprétation d'un extrait cité, et ses phrases citées."""
+
+    text: str
+    spans: tuple[Span, ...] = ()
+    translations: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -176,6 +221,8 @@ class RawTranslation:
     conclusion: str
     # Identifiant -> persona -> formulation.
     actions: Mapping[str, Mapping[str, RawProjection]]
+    # Identifiant d'extrait -> interprétation.
+    readings: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +234,8 @@ class RawRestitution:
     actions: tuple[RawAction, ...]
     # Langue -> traduction ; seules les langues demandées (`tr`) comptent.
     translations: Mapping[str, RawTranslation] = field(default_factory=dict)
+    # Identifiant d'extrait -> interprétation.
+    readings: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -197,6 +246,7 @@ class RestitutionBatch:
     content: dict[str, Any] = field(default_factory=dict)
     findings: dict[str, Finding] = field(default_factory=dict)
     excerpt_keys: dict[str, UUID] = field(default_factory=dict)
+    excerpts: dict[str, Excerpt] = field(default_factory=dict)
     # Extraits proposés pour chaque candidat : seuls citables (GF-1).
     allowed: dict[str, frozenset[str]] = field(default_factory=dict)
     origins: tuple[str, ...] = ()
@@ -220,6 +270,9 @@ class Restitution:
     # Langue de rédaction (celle de l'approche) et conclusion traduite.
     locale: str | None = None
     conclusion_translations: dict[str, str] = field(default_factory=dict)
+    conclusion_citations: list[Source] = field(default_factory=list)
+    # Segment cité -> interprétation de l'extrait.
+    readings: dict[UUID, Reading] = field(default_factory=dict)
 
     @property
     def status(self) -> Status:
@@ -279,6 +332,7 @@ class Restitution:
                     locale: {"conclusion": conclusion}
                     for locale, conclusion in self.conclusion_translations.items()
                 },
+                "citations": [source.as_dict() for source in self.conclusion_citations],
             },
             "items": [
                 {
@@ -289,6 +343,7 @@ class Restitution:
                     "translations": finding.translations,
                     **origin(finding),
                     "segment_ids": [str(segment) for segment in finding.segment_ids],
+                    "citations": [source.as_dict() for source in finding.citations],
                 }
                 for section in sections
                 for position, finding in enumerate(self.items(section), start=1)
@@ -301,10 +356,19 @@ class Restitution:
                     **origin(action.finding),
                     "segment_ids": [str(segment) for segment in action.segment_ids],
                     "projections": [
-                        asdict(projection) for projection in action.projections
+                        projection.as_dict() for projection in action.projections
                     ],
                 }
                 for position, action in enumerate(self.actions, start=1)
+            ],
+            "readings": [
+                {
+                    "segment_id": str(segment_id),
+                    "interpretation": reading.text,
+                    "translations": reading.translations,
+                    "spans": [list(span) for span in reading.spans] or None,
+                }
+                for segment_id, reading in self.readings.items()
             ],
         }
 
@@ -642,8 +706,11 @@ def build_batch(
                 excerpt_key = f"E{len(key_of_segment) + 1}"
                 key_of_segment[segment_id] = excerpt_key
                 batch.excerpt_keys[excerpt_key] = segment_id
-                batch.content["x"][excerpt_key] = truncate(
-                    texts[segment_id], rules.excerpt_chars
+                batch.excerpts[excerpt_key] = excerpt(
+                    segment_id, texts[segment_id], rules.excerpt_chars
+                )
+                batch.content["x"][excerpt_key] = list(
+                    batch.excerpts[excerpt_key].sentences
                 )
             keys.append(excerpt_key)
         batch.findings[finding.key] = finding
@@ -668,22 +735,27 @@ def build_batch(
         OUTPUT_TOKENS_CONCLUSION
         + OUTPUT_TOKENS_PER_ITEM * items
         + OUTPUT_TOKENS_PER_ACTION * len(batch.origins)
+        + OUTPUT_TOKENS_PER_READING * len(batch.excerpts)
     )
     return batch
 
 
-def _cited(batch: RestitutionBatch, key: str, excerpts: Iterable[str]) -> list[UUID]:
-    """Extraits cités parmi ceux proposés pour le candidat."""
-    allowed = batch.allowed.get(key, frozenset())
-    return [
-        batch.excerpt_keys[excerpt]
-        for excerpt in dict.fromkeys(excerpts)
-        if excerpt in allowed
-    ]
+def _cited(
+    batch: RestitutionBatch,
+    key: str,
+    excerpts: Iterable[str],
+    spans: dict[str, list[Span]],
+) -> list[UUID]:
+    """Extraits cités parmi ceux proposés pour le candidat ; leurs phrases
+    citées s'ajoutent à `spans`."""
+    found = cited(excerpts, batch.excerpts, batch.allowed.get(key, frozenset()))
+    for excerpt_key, cited_spans in found.items():
+        spans.setdefault(excerpt_key, []).extend(cited_spans)
+    return [batch.excerpt_keys[excerpt_key] for excerpt_key in found]
 
 
 def _reason(text: str) -> str:
-    return truncate(BECAUSE.sub("", text, count=1), PROJECTION_CHARS)
+    return truncate_cited(BECAUSE.sub("", text, count=1), PROJECTION_CHARS)
 
 
 def _narrative(text: str, limit: int) -> str:
@@ -694,27 +766,40 @@ def _narrative(text: str, limit: int) -> str:
         for paragraph in re.split(r"\n\s*\n", text)
         if paragraph.strip()
     ]
-    joined = "\n\n".join(paragraphs)
-    if len(joined) <= limit:
-        return joined
-    cut = joined[: limit - 1]
-    space = max(cut.rfind(" "), cut.rfind("\n"))
-    if space > limit // 2:
-        cut = cut[:space]
-    return cut.rstrip() + "…"
+    return cut("\n\n".join(paragraphs), limit)
 
 
-def _projection(projection: RawProjection | None) -> dict[str, str] | None:
-    """Formulation exploitable, ou `None` (texte ou raison manquant)."""
+def _projection(
+    projection: RawProjection | None,
+    citations: Citations,
+    allowed: frozenset[str],
+) -> dict[str, str] | None:
+    """Formulation exploitable, ses sources numérotées dans `citations`, ou
+    `None` (texte ou raison manquant)."""
     if projection is None or not projection.text.strip():
         return None
-    reason = _reason(projection.justification)
-    if not reason:
+    reason = _reason(citations.cite(projection.justification, allowed))
+    if not plain(reason).strip():
         return None
     return {
-        "text": truncate(projection.text, PROJECTION_CHARS),
+        "text": truncate_cited(
+            citations.cite(projection.text, allowed), PROJECTION_CHARS
+        ),
         "justification": reason,
     }
+
+
+def _written(
+    text: str | None,
+    citations: Citations,
+    allowed: frozenset[str] | None,
+    limit: int,
+) -> str | None:
+    """Texte de l'IA, ses sources numérotées, coupé à `limit` caractères
+    hors marqueurs ; `None` s'il est vide."""
+    if not text or not text.strip():
+        return None
+    return truncate_cited(citations.cite(text, allowed), limit)
 
 
 def interpret(
@@ -727,6 +812,11 @@ def interpret(
     factuel ; sans extrait valable, elle garde ses preuves. Une action sans
     ses trois projections, ou hors des origines proposées, est ignorée.
 
+    Sources : une puce et une action ne citent que les extraits proposés
+    pour elles (leur liste `e` et les marqueurs de leurs textes) ; la
+    conclusion, tous les extraits de l'appel. Chaque texte numérote ses
+    sources, les mêmes dans toutes ses traductions.
+
     Traductions : seules les langues demandées comptent, et seulement pour
     ce qui a été rédigé dans la langue du run. Une action n'est traduite
     qu'avec ses trois projections ; ce qui manque s'affiche dans la langue
@@ -736,33 +826,69 @@ def interpret(
         for locale in batch.locales
         if locale in raw.translations
     }
+    # Phrases citées par extrait, pour la lecture des preuves.
+    spans: dict[str, list[Span]] = {}
     seen: set[str] = set()
     for item in raw.items:
         finding = batch.findings.get(item.key)
         if finding is None or finding.section is None or item.key in seen:
             continue
         seen.add(item.key)
-        if item.text and item.text.strip():
-            finding.text = truncate(item.text, ITEM_CHARS)
-            for locale, translation in translations.items():
-                text = (translation.items.get(item.key) or "").strip()
-                if text:
-                    finding.translations[locale] = truncate(text, ITEM_CHARS)
-        cited = _cited(batch, item.key, item.excerpts)
-        if cited:
-            finding.segment_ids = cited
-
-    conclusion = (raw.conclusion or "").strip()
-    restitution.conclusion = (
-        _narrative(conclusion, CONCLUSION_CHARS) if conclusion else None
-    )
-    if restitution.conclusion:
-        for locale, translation in translations.items():
-            translated = (translation.conclusion or "").strip()
-            if translated:
-                restitution.conclusion_translations[locale] = _narrative(
-                    translated, CONCLUSION_CHARS
+        allowed = batch.allowed.get(item.key, frozenset())
+        citations = Citations(batch.excerpts)
+        text = _written(item.text, citations, allowed, ITEM_CHARS)
+        if text:
+            translated = {
+                locale: _written(
+                    translation.items.get(item.key), citations, allowed, ITEM_CHARS
                 )
+                for locale, translation in translations.items()
+            }
+            locales = [locale for locale, value in translated.items() if value]
+            texts, finding.citations = compact(
+                [text, *(translated[locale] for locale in locales)],
+                citations.sources,
+            )
+            finding.text = fit(texts[0] or "", ITEM_MAX_CHARS)
+            for locale, value in zip(locales, texts[1:], strict=True):
+                finding.translations[locale] = fit(value or "", ITEM_MAX_CHARS)
+        found = _cited(batch, item.key, [*item.excerpts, *references(item.text)], spans)
+        if found:
+            finding.segment_ids = found
+
+    # Conclusion en paragraphes : `_narrative` garde les lignes vides.
+    citations = Citations(batch.excerpts)
+
+    def narrative(text: str | None) -> str | None:
+        if not text or not text.strip():
+            return None
+        return _narrative(citations.cite(text), CONCLUSION_CHARS) or None
+
+    conclusion = narrative(raw.conclusion)
+    if conclusion:
+        translated = {
+            locale: narrative(translation.conclusion)
+            for locale, translation in translations.items()
+        }
+        locales = [locale for locale, value in translated.items() if value]
+        texts, restitution.conclusion_citations = compact(
+            [conclusion, *(translated[locale] for locale in locales)],
+            citations.sources,
+        )
+        restitution.conclusion = fit(texts[0] or "", CONCLUSION_MAX_CHARS)
+        for locale, value in zip(locales, texts[1:], strict=True):
+            restitution.conclusion_translations[locale] = fit(
+                value or "", CONCLUSION_MAX_CHARS
+            )
+        for source in restitution.conclusion_citations:
+            key = next(
+                key
+                for key, item in batch.excerpts.items()
+                if item.segment_id == source.segment_id
+            )
+            spans.setdefault(key, []).extend(source.spans)
+    else:
+        restitution.conclusion = None
 
     actions: dict[str, Action] = {}
     for raw_action in raw.actions:
@@ -773,37 +899,98 @@ def interpret(
             or raw_action.key in actions
         ):
             continue
+        allowed = batch.allowed.get(raw_action.key, frozenset())
+        by_persona = {persona: Citations(batch.excerpts) for persona in PERSONAS}
         written = {
-            persona: _projection(raw_action.projections.get(persona))
+            persona: _projection(
+                raw_action.projections.get(persona), by_persona[persona], allowed
+            )
             for persona in PERSONAS
         }
         if not all(written.values()):
             continue
-        translated: dict[str, dict[str, dict[str, str]]] = {}
+        translated: dict[str, dict[str, dict[str, str] | None]] = {}
         for locale, translation in translations.items():
-            by_persona = translation.actions.get(raw_action.key) or {}
+            raw_versions = translation.actions.get(raw_action.key) or {}
             versions = {
-                persona: _projection(by_persona.get(persona)) for persona in PERSONAS
+                persona: _projection(
+                    raw_versions.get(persona), by_persona[persona], allowed
+                )
+                for persona in PERSONAS
             }
             if all(versions.values()):
                 translated[locale] = versions
+        projections: list[Projection] = []
+        for persona in PERSONAS:
+            original = written[persona]
+            assert original is not None
+            versions = [
+                (locale, versions[persona]) for locale, versions in translated.items()
+            ]
+            texts, sources = compact(
+                [
+                    original["text"],
+                    original["justification"],
+                    *(
+                        value
+                        for _, version in versions
+                        if version is not None
+                        for value in (version["text"], version["justification"])
+                    ),
+                ],
+                by_persona[persona].sources,
+            )
+            projections.append(
+                Projection(
+                    persona,
+                    fit(texts[0] or "", PROJECTION_MAX_CHARS),
+                    fit(texts[1] or "", PROJECTION_MAX_CHARS),
+                    {
+                        locale: {
+                            "text": fit(
+                                texts[2 + 2 * index] or "", PROJECTION_MAX_CHARS
+                            ),
+                            "justification": fit(
+                                texts[3 + 2 * index] or "", PROJECTION_MAX_CHARS
+                            ),
+                        }
+                        for index, (locale, _) in enumerate(versions)
+                    },
+                    sources,
+                )
+            )
+        action_references = [
+            *raw_action.excerpts,
+            *(
+                reference
+                for persona in PERSONAS
+                if (projection := raw_action.projections.get(persona)) is not None
+                for reference in references(
+                    f"{projection.text} {projection.justification}"
+                )
+            ),
+        ]
         actions[raw_action.key] = Action(
             id=new_id(),
             finding=finding,
-            segment_ids=_cited(batch, raw_action.key, raw_action.excerpts)
+            segment_ids=_cited(batch, raw_action.key, action_references, spans)
             or finding.segment_ids,
-            projections=[
-                Projection(
-                    persona,
-                    written[persona]["text"],
-                    written[persona]["justification"],
-                    {
-                        locale: versions[persona]
-                        for locale, versions in translated.items()
-                    },
-                )
-                for persona in PERSONAS
-            ],
+            projections=projections,
         )
     restitution.actions = [actions[key] for key in batch.origins if key in actions]
+
+    # Interprétation des extraits : lue à la place de l'extrait brut.
+    for key, text in raw.readings.items():
+        item = batch.excerpts.get(key.strip().upper())
+        if item is None or not text or not text.strip():
+            continue
+        reading = Reading(
+            truncate(text, READING_CHARS),
+            tuple(merge(spans.get(key.strip().upper(), ()))),
+        )
+        for locale, translation in translations.items():
+            value = (translation.readings.get(key) or "").strip()
+            if value:
+                reading.translations[locale] = truncate(value, READING_CHARS)
+        restitution.readings[item.segment_id] = reading
     restitution.qualified = True

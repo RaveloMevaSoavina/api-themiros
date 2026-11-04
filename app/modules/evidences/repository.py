@@ -18,7 +18,7 @@ class EvidenceRepository:
             token=token,
             params={
                 "select": (
-                    "id,page_number,excerpt,"
+                    "id,page_number,excerpt,spans,"
                     "documents(original_filename,storage_path,mime_type)"
                 ),
                 "id": f"eq.{evidence_id}",

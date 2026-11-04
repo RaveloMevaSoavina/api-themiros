@@ -8,6 +8,7 @@ se surligne ; un DOCX ou un XLSX s'ouvre tel quel depuis le stockage.
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -33,7 +34,14 @@ class EvidenceService:
     def __init__(self, repository: EvidenceRepository) -> None:
         self._repository = repository
 
-    async def document(self, evidence_id: UUID, user: CurrentUser) -> EvidenceDocument:
+    async def document(
+        self,
+        evidence_id: UUID,
+        user: CurrentUser,
+        spans: Sequence[tuple[int, int]] | None = None,
+    ) -> EvidenceDocument:
+        """`spans` : phrases citées par un texte de la restitution ; à
+        défaut, celles que cite la preuve, sinon l'extrait entier."""
         evidence = await self._repository.evidence(evidence_id, token=user.token)
         if evidence is None:
             raise ApiError(
@@ -57,9 +65,10 @@ class EvidenceService:
 
         content = await self._repository.download(document["storage_path"])
         page = evidence.get("page_number")
+        cited = spans or evidence.get("spans") or None
         try:
             result = await asyncio.to_thread(
-                highlight, content, evidence.get("excerpt") or "", page
+                highlight, content, evidence.get("excerpt") or "", page, cited
             )
         except Exception:
             # Un PDF que MuPDF ne sait pas annoter reste lisible tel quel.

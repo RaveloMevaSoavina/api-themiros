@@ -8,10 +8,14 @@ Déroulé, pour un run :
 2. `build_batches` : seuls les critères dont au moins 50 % des sous-questions
    ont des extraits sont soumis à l'IA (RG-1) ; les autres sont non conclus
    sans appel. Tout le run tient en un seul appel : extraits dédoublonnés,
-   tronqués, désignés par des identifiants courts (E1, Q1, C1). Plusieurs
-   appels seulement si le volume dépasse le plafond ;
+   découpés en phrases, désignés par des identifiants courts (E1, Q1, C1).
+   Plusieurs appels seulement si le volume dépasse le plafond ;
 3. `interpret` : une sous-question n'est documentée que si l'IA lui donne une
-   note en citant au moins un de ses propres extraits (GF-1, RG-4) ;
+   note en citant au moins un de ses propres extraits (GF-1, RG-4). L'IA
+   cite des phrases (E1.2) : la preuve garde leurs positions, que le
+   surlignage reprend, et une phrase d'interprétation de l'extrait pour la
+   sous-question. La justification du critère cite ses sources dans le
+   texte (`citations`) ;
 4. `finalize` : note du critère = moyenne des notes des sous-questions
    documentées, si au moins 50 % le sont ; ambiguïté si les extraits se
    contredisent ou si les notes sont dispersées (RG-3).
@@ -30,9 +34,23 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-LAYER_B_VERSION = "layer-b/1.0.0"
+from app.modules.evidences.passages import Span, merge
+from app.modules.runs.citations import (
+    Citations,
+    Excerpt,
+    Source,
+    cited,
+    compact,
+    excerpt,
+    fit,
+)
+from app.modules.runs.citations import truncate as truncate_cited
+
+LAYER_B_VERSION = "layer-b/1.1.0"
 PROMPT_CODE = "grade_sub_questions"
-PROMPT_VERSION = "v1.0"
+# v1.1 : extraits en phrases, phrases citées, interprétation de chaque
+# extrait cité, sources dans la justification.
+PROMPT_VERSION = "v1.1"
 
 NoteStatus = Literal["conclu", "non_conclu"]
 AnswerStatus = Literal["documentee", "non_documentee"]
@@ -41,11 +59,16 @@ AnswerStatus = Literal["documentee", "non_documentee"]
 # (estimation prudente), plus le prompt système.
 CHARS_PER_TOKEN = 3
 SYSTEM_PROMPT_TOKENS = 700
-OUTPUT_TOKENS_PER_QUESTION = 30
-OUTPUT_TOKENS_PER_CRITERION = 120
+# Note, extraits cités et leur interprétation (une phrase chacun).
+OUTPUT_TOKENS_PER_QUESTION = 120
+OUTPUT_TOKENS_PER_CRITERION = 150
 DEFINITION_CHARS = 200
 EXPECTED_EVIDENCE_CHARS = 160
 JUSTIFICATION_CHARS = 600
+# Plafond de la base pour une justification, marqueurs compris.
+JUSTIFICATION_MAX_CHARS = 1000
+# Le prompt (v1.1) demande 160 caractères.
+READING_CHARS = 220
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +78,7 @@ class LayerBRules:
     excerpts_per_question: int = 3
     excerpt_chars: int = 600
     max_input_tokens: int = 30000
-    max_output_tokens: int = 6000
+    max_output_tokens: int = 12000
     documented_ratio: float = 0.5
     ambiguity_std: float = 1.0
 
@@ -147,6 +170,9 @@ class Grade:
     note: int
     segment_ids: tuple[UUID, ...]
     contradictory: bool
+    # Par segment cité : positions des phrases citées, interprétation.
+    spans: Mapping[UUID, tuple[Span, ...]] = field(default_factory=dict)
+    readings: Mapping[UUID, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +183,8 @@ class RawGrade:
     note: int | None
     excerpts: tuple[str, ...]
     contradictory: bool
+    # Identifiant d'extrait -> interprétation pour la sous-question.
+    readings: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,8 +203,12 @@ class GradingBatch:
     criterion_keys: dict[str, UUID] = field(default_factory=dict)
     question_keys: dict[str, UUID] = field(default_factory=dict)
     excerpt_keys: dict[str, UUID] = field(default_factory=dict)
+    excerpts: dict[str, Excerpt] = field(default_factory=dict)
     # Extraits proposés pour chaque sous-question : seuls citables (GF-1).
     allowed: dict[UUID, frozenset[str]] = field(default_factory=dict)
+    # Extraits citables par la justification d'un critère : ceux de ses
+    # sous-questions.
+    criterion_allowed: dict[UUID, frozenset[str]] = field(default_factory=dict)
     estimated_input_tokens: int = 0
     max_output_tokens: int = 0
 
@@ -191,6 +223,7 @@ class Grading:
     graded_criteria: set[UUID] = field(default_factory=set)
     grades: dict[UUID, Grade] = field(default_factory=dict)
     justifications: dict[UUID, str] = field(default_factory=dict)
+    citations: dict[UUID, list[Source]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -203,6 +236,9 @@ class SubAnswerResult:
     evidences: list[Candidate]
     # Critère de la sous-question : la couche C y rattache ses preuves.
     criterion_id: UUID | None = None
+    # Par segment cité : positions des phrases citées, interprétation.
+    spans: Mapping[UUID, tuple[Span, ...]] = field(default_factory=dict)
+    readings: Mapping[UUID, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -214,6 +250,8 @@ class CriterionNote:
     total: int
     justification: str
     ambiguous: bool
+    # Sources numérotées de la justification (« ⟦1⟧ »).
+    citations: list[Source] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -245,6 +283,7 @@ class LayerBResults:
                     "total_sub_questions": note.total,
                     "justification": note.justification,
                     "ambiguity_flag": note.ambiguous,
+                    "citations": [source.as_dict() for source in note.citations],
                 }
                 for note in self.notes
             ],
@@ -263,6 +302,12 @@ class LayerBResults:
                     "sub_answer_id": str(answer.id),
                     "segment_id": str(candidate.segment_id),
                     "similarity": candidate.similarity,
+                    "interpretation": answer.readings.get(candidate.segment_id),
+                    "spans": (
+                        [list(span) for span in answer.spans[candidate.segment_id]]
+                        if answer.spans.get(candidate.segment_id)
+                        else None
+                    ),
                 }
                 for answer in self.answers
                 for candidate in answer.evidences
@@ -351,12 +396,14 @@ def _with_criterion(
 ) -> GradingBatch:
     """Copie du lot augmentée d'un critère (le lot d'origine reste intact
     si le critère doit partir dans le lot suivant)."""
-    excerpts: dict[str, str] = dict(batch.content.get("x", {}))
+    excerpts: dict[str, list[str]] = dict(batch.content.get("x", {}))
+    excerpt_items = dict(batch.excerpts)
     excerpt_keys = dict(batch.excerpt_keys)
     key_of_segment = {segment: key for key, segment in excerpt_keys.items()}
     question_keys = dict(batch.question_keys)
     allowed = dict(batch.allowed)
     criterion_keys = dict(batch.criterion_keys)
+    criterion_allowed = dict(batch.criterion_allowed)
 
     criterion_key = f"C{len(criterion_keys) + 1}"
     criterion_keys[criterion_key] = criterion.id
@@ -371,13 +418,19 @@ def _with_criterion(
                 key = f"E{len(excerpt_keys) + 1}"
                 excerpt_keys[key] = candidate.segment_id
                 key_of_segment[candidate.segment_id] = key
-                excerpts[key] = truncate(candidate.text, rules.excerpt_chars)
+                excerpt_items[key] = excerpt(
+                    candidate.segment_id, candidate.text, rules.excerpt_chars
+                )
+                excerpts[key] = list(excerpt_items[key].sentences)
             keys.append(key)
         allowed[question.id] = frozenset(keys)
         item: dict[str, Any] = {"k": question_key, "t": question.text, "e": keys}
         if question.expected_evidence:
             item["p"] = truncate(question.expected_evidence, EXPECTED_EVIDENCE_CHARS)
         asked.append(item)
+    criterion_allowed[criterion.id] = frozenset(
+        key for question in questions for key in allowed[question.id]
+    )
 
     entry: dict[str, Any] = {
         "k": criterion_key,
@@ -399,7 +452,9 @@ def _with_criterion(
         criterion_keys=criterion_keys,
         question_keys=question_keys,
         excerpt_keys=excerpt_keys,
+        excerpts=excerpt_items,
         allowed=allowed,
+        criterion_allowed=criterion_allowed,
     )
     extended.estimated_input_tokens = SYSTEM_PROMPT_TOKENS + (
         len(extended.message()) // CHARS_PER_TOKEN
@@ -413,7 +468,8 @@ def _with_criterion(
 def interpret(batch: GradingBatch, raw: RawGrading, grading: Grading) -> None:
     """Ajoute à `grading` les notes valides d'une réponse IA. Une note hors
     barème, sans extrait cité, ou citant un extrait qui n'était pas proposé
-    pour la question, n'est pas retenue : la question reste non documentée."""
+    pour la question, n'est pas retenue : la question reste non documentée.
+    Une interprétation ne vaut que pour un extrait cité par la note."""
     grading.graded_criteria.update(criterion.id for criterion in batch.criteria)
     for raw_grade in raw.grades:
         question_id = batch.question_keys.get(raw_grade.key)
@@ -421,20 +477,41 @@ def interpret(batch: GradingBatch, raw: RawGrading, grading: Grading) -> None:
             continue
         if raw_grade.note is None or raw_grade.note not in (0, 1, 2, 3):
             continue
-        cited = [
-            batch.excerpt_keys[key]
-            for key in dict.fromkeys(raw_grade.excerpts)
-            if key in batch.allowed.get(question_id, ())
-        ]
-        if not cited:
+        found = cited(
+            raw_grade.excerpts, batch.excerpts, batch.allowed.get(question_id, ())
+        )
+        if not found:
             continue
+        readings: dict[UUID, str] = {}
+        for reference, text in raw_grade.readings.items():
+            key = next(iter(cited([reference], batch.excerpts)), None)
+            if key in found and text and text.strip():
+                readings.setdefault(
+                    batch.excerpt_keys[key], truncate(text, READING_CHARS)
+                )
         grading.grades[question_id] = Grade(
-            raw_grade.note, tuple(cited), raw_grade.contradictory
+            raw_grade.note,
+            tuple(batch.excerpt_keys[key] for key in found),
+            raw_grade.contradictory,
+            spans={
+                batch.excerpt_keys[key]: tuple(merge(spans))
+                for key, spans in found.items()
+            },
+            readings=readings,
         )
     for key, text in raw.justifications.items():
         criterion_id = batch.criterion_keys.get(key)
-        if criterion_id is not None and text and text.strip():
-            grading.justifications[criterion_id] = truncate(text, JUSTIFICATION_CHARS)
+        if criterion_id is None or not text or not text.strip():
+            continue
+        citations = Citations(batch.excerpts)
+        written = citations.cite(text, batch.criterion_allowed.get(criterion_id, ()))
+        (written,), sources = compact(
+            [truncate_cited(written, JUSTIFICATION_CHARS)], citations.sources
+        )
+        grading.justifications[criterion_id] = fit(
+            written or "", JUSTIFICATION_MAX_CHARS
+        )
+        grading.citations[criterion_id] = sources
 
 
 JUSTIFICATIONS = {
@@ -515,6 +592,8 @@ def finalize(
                     contradictory=grade.contradictory if grade else False,
                     evidences=evidences,
                     criterion_id=criterion.id,
+                    spans=grade.spans if grade else {},
+                    readings=grade.readings if grade else {},
                 )
             )
 
@@ -552,6 +631,9 @@ def finalize(
                 justification=grading.justifications.get(criterion.id)
                 or justification(inputs.locale, reason, documented, total),
                 ambiguous=is_ambiguous(grades, rules.ambiguity_std),
+                citations=grading.citations.get(criterion.id, [])
+                if criterion.id in grading.justifications
+                else [],
             )
         )
     return LayerBResults(notes=notes, answers=answers)

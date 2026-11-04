@@ -115,7 +115,7 @@ def test_the_whole_run_fits_in_one_call_with_shared_extracts() -> None:
         "p": "Rapport de suivi",
     }
     assert batch.estimated_input_tokens > 0
-    assert batch.max_output_tokens == 4 * 30 + 2 * 120
+    assert batch.max_output_tokens == 4 * 120 + 2 * 150
 
 
 def test_extracts_are_capped_and_truncated() -> None:
@@ -132,7 +132,10 @@ def test_extracts_are_capped_and_truncated() -> None:
 
     content = json.loads(batch.message())
     assert len(content["x"]) == 2
-    assert all(len(text) <= 100 for text in content["x"].values())
+    assert all(
+        sum(len(sentence) for sentence in sentences) <= 100
+        for sentences in content["x"].values()
+    )
 
 
 def test_criteria_are_split_only_beyond_the_token_ceiling() -> None:
@@ -279,3 +282,52 @@ def test_payload_matches_complete_run() -> None:
 def test_truncate_cuts_on_a_word() -> None:
     assert truncate("un deux   trois", 50) == "un deux trois"
     assert truncate("alpha beta gamma delta", 12) == "alpha beta…"
+
+
+def test_cited_sentences_and_readings_follow_each_evidence() -> None:
+    criterion = _criterion("Pertinence", 1)
+    question = criterion.questions[0]
+    text = (
+        "Le projet répond aux priorités nationales. "
+        "Le comité valide le plan chaque année."
+    )
+    segment = uuid4()
+    candidates = [Candidate(question.id, segment, DOCUMENTS[0], 0.6, text)]
+    retrieved = retrieve(candidates, RULES)
+    (batch,) = build_batches(_inputs(criterion), retrieved, RULES)
+    content = json.loads(batch.message())
+    assert content["x"] == {
+        "E1": [
+            "Le projet répond aux priorités nationales.",
+            "Le comité valide le plan chaque année.",
+        ]
+    }
+    raw = RawGrading(
+        grades=(
+            RawGrade(
+                "Q1", 3, ("E1.2",), False, {"E1.2": "Le plan est validé.", "E7": "?"}
+            ),
+        ),
+        justifications={"C1": "Le plan est validé chaque année [E1.2, E5]."},
+    )
+    grading = Grading()
+
+    interpret(batch, raw, grading)
+    results = finalize(_inputs(criterion), retrieved, grading, RULES)
+
+    second = (text.index("Le comité"), len(text))
+    (answer,) = results.answers
+    assert answer.spans == {segment: (second,)}
+    assert answer.readings == {segment: "Le plan est validé."}
+    (note,) = results.notes
+    # E5 n'est pas un extrait du critère : seule la source E1.2 reste.
+    assert note.justification == "Le plan est validé chaque année⟦1⟧."
+    assert [source.as_dict() for source in note.citations] == [
+        {"segment_id": str(segment), "spans": [list(second)]}
+    ]
+    payload = results.payload()
+    assert payload["evidences"][0]["interpretation"] == "Le plan est validé."
+    assert payload["evidences"][0]["spans"] == [list(second)]
+    assert payload["notes"][0]["citations"] == [
+        {"segment_id": str(segment), "spans": [list(second)]}
+    ]

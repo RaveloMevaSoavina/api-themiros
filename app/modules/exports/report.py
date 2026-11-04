@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Any
 
 from app.modules.exports.labels import labels_for
+from app.modules.runs.citations import plain
 
 EXCERPT_CHARS = 400
 EXCERPTS_PER_NOTE = 2
@@ -537,7 +538,8 @@ def build_report(
             status=row["status"],
             documented=int(row.get("documented_sub_questions") or 0),
             total=int(row.get("total_sub_questions") or 0),
-            justification=row.get("justification"),
+            # Sources du texte : les notes du critère les portent déjà.
+            justification=plain(row.get("justification")) or None,
             ambiguous=bool(row.get("ambiguity_flag")),
             notes=citations.cite(
                 [
@@ -612,7 +614,7 @@ def build_report(
         SynthesisLine(
             section=row["section"],
             position=int(row["position"]),
-            text=(row.get("translations") or {}).get(locale) or row["text"],
+            text=plain((row.get("translations") or {}).get(locale) or row["text"]),
             origin=origin(row, kind_of(row)),
             notes=citations.cite(_evidence_ids(row, "synthesis_item_evidences")),
         )
@@ -642,8 +644,8 @@ def build_report(
         actions.append(
             ActionLine(
                 position=int(row["position"]),
-                text=projection["text"],
-                justification=projection["justification"],
+                text=plain(projection["text"]),
+                justification=plain(projection["justification"]),
                 origin=origin(row, row.get("origin_type") or kind_of(row)),
                 notes=citations.cite(_evidence_ids(row, "run_action_evidences")),
             )
@@ -671,12 +673,13 @@ def build_report(
         criteria=criteria,
         alerts=alerts,
         synthesis=synthesis,
-        conclusion=(
+        conclusion=plain(
             ((rows.synthesis or {}).get("translations") or {})
             .get(locale, {})
             .get("conclusion")
             or (rows.synthesis or {}).get("conclusion")
-        ),
+        )
+        or None,
         restitution_status=(rows.synthesis or {}).get("status"),
         actions=actions,
         limits=[],

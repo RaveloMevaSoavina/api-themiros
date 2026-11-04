@@ -6,13 +6,21 @@ suivante. On aligne ses mots, normalisés, sur ceux de ces pages : l'alignement
 tolère césures, ligatures et retours à la ligne, que la recherche exacte d'une
 chaîne ne passe pas. Une page scannée n'a pas de couche texte : rien ne s'y
 aligne, le PDF est rendu tel quel.
+
+Phrases citées (`spans`, positions dans l'extrait) : l'extrait entier est
+aligné, ce qui ancre une phrase courte au bon endroit de la page, puis
+seuls ses mots dans les phrases citées sont surlignés. Des phrases mal
+retrouvées laissent surligné l'extrait entier.
 """
 
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 import pymupdf
 
+from app.modules.evidences.passages import merge
 from app.modules.ingestion.analysis.text import normalize
 
 # Plus court passage aligné retenu : en deçà, des mots isolés communs
@@ -48,18 +56,53 @@ def _tokens(page: pymupdf.Page) -> list[_Token]:
     return tokens
 
 
-def _matches(tokens: list[_Token], excerpt: list[str]) -> list[_Token]:
+_WORD = re.compile(r"\S+")
+
+
+def _excerpt_tokens(excerpt: str) -> list[tuple[str, int]]:
+    """Mots normalisés de l'extrait, avec leur position dans le texte."""
+    return [
+        (text, word.start())
+        for word in _WORD.finditer(excerpt)
+        for text in normalize(word.group()).split()
+    ]
+
+
+def _matches(
+    tokens: list[_Token], excerpt: list[tuple[str, int]]
+) -> list[tuple[int, _Token]]:
+    """Mots de la page alignés sur l'extrait, avec la position du mot de
+    l'extrait auquel chacun répond."""
     matcher = SequenceMatcher(
-        None, [token.text for token in tokens], excerpt, autojunk=False
+        None,
+        [token.text for token in tokens],
+        [text for text, _ in excerpt],
+        autojunk=False,
     )
     run = min(MIN_RUN, len(excerpt))
     matched = [
-        tokens[block.a + offset]
+        (excerpt[block.b + offset][1], tokens[block.a + offset])
         for block in matcher.get_matching_blocks()
         if block.size >= run
         for offset in range(block.size)
     ]
     return matched if len(matched) >= MIN_COVERAGE * len(excerpt) else []
+
+
+def _within(
+    matched: list[tuple[int, _Token]],
+    excerpt: list[tuple[str, int]],
+    spans: list[tuple[int, int]],
+) -> list[_Token]:
+    """Mots alignés qui tombent dans les phrases citées, ou `[]` si une trop
+    faible part de ces phrases a été retrouvée."""
+
+    def inside(position: int) -> bool:
+        return any(start <= position < end for start, end in spans)
+
+    expected = sum(inside(position) for _, position in excerpt)
+    kept = [token for position, token in matched if inside(position)]
+    return kept if expected and len(kept) >= MIN_COVERAGE * expected else []
 
 
 def _lines(tokens: list[_Token]) -> dict[int, list[pymupdf.Rect]]:
@@ -74,8 +117,14 @@ def _lines(tokens: list[_Token]) -> dict[int, list[pymupdf.Rect]]:
     return pages
 
 
-def highlight(content: bytes, excerpt: str, page_number: int | None) -> HighlightedPdf:
-    """Le PDF avec l'extrait surligné, ouvert sur la page où il commence."""
+def highlight(
+    content: bytes,
+    excerpt: str,
+    page_number: int | None,
+    spans: Sequence[Sequence[int]] | None = None,
+) -> HighlightedPdf:
+    """Le PDF avec l'extrait surligné (ses phrases citées seules, quand
+    `spans` les désigne), ouvert sur la page où le passage commence."""
     document = pymupdf.open("pdf", content)
     if document.needs_pass or not page_number or page_number > document.page_count:
         return HighlightedPdf(content, page_number, False)
@@ -86,9 +135,13 @@ def highlight(content: bytes, excerpt: str, page_number: int | None) -> Highligh
     tokens = [
         token for index in range(first, last + 1) for token in _tokens(document[index])
     ]
-    matched = _matches(tokens, normalize(excerpt).split())
-    if not matched:
+    words = _excerpt_tokens(excerpt)
+    aligned = _matches(tokens, words)
+    if not aligned:
         return HighlightedPdf(content, page_number, False)
+    matched = [token for _, token in aligned]
+    if spans:
+        matched = _within(aligned, words, merge(spans)) or matched
 
     for index, rects in _lines(matched).items():
         # La page doit vivre autant que son annotation.
