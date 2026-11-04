@@ -1,9 +1,12 @@
+import logging
 from typing import Any
 
 import httpx
 
 from app.core.config import Settings
 from app.core.errors import ApiError
+
+logger = logging.getLogger(__name__)
 
 
 class SupabaseGateway:
@@ -230,11 +233,10 @@ class SupabaseGateway:
         if response.status_code == 422 and self._email_exists(response):
             return None
         if not response.is_success:
-            raise ApiError(
-                status_code=503,
+            raise self._auth_failure(
+                response,
                 code="INVITATION_EMAIL_FAILED",
                 detail="Supabase n'a pas pu envoyer l'e-mail d'invitation",
-                context={"upstream_status": response.status_code},
             )
         return response.json()
 
@@ -267,11 +269,10 @@ class SupabaseGateway:
                 detail="Mot de passe refusé par Supabase Auth : trop faible",
             )
         if not response.is_success:
-            raise ApiError(
-                status_code=503,
+            raise self._auth_failure(
+                response,
                 code="USER_CREATE_FAILED",
                 detail="Supabase n'a pas pu créer le compte",
-                context={"upstream_status": response.status_code},
             )
         return response.json()
 
@@ -286,11 +287,10 @@ class SupabaseGateway:
             timeout=15,
         )
         if not response.is_success:
-            raise ApiError(
-                status_code=503,
+            raise self._auth_failure(
+                response,
                 code="USER_BAN_FAILED",
                 detail="Supabase n'a pas pu bloquer ou débloquer le compte",
-                context={"upstream_status": response.status_code},
             )
 
     async def auth_delete_user(self, user_id: str) -> None:
@@ -302,12 +302,42 @@ class SupabaseGateway:
         if response.status_code == 404:
             return
         if not response.is_success:
-            raise ApiError(
-                status_code=503,
+            raise self._auth_failure(
+                response,
                 code="USER_DELETE_FAILED",
                 detail="Supabase n'a pas pu supprimer le compte",
-                context={"upstream_status": response.status_code},
             )
+
+    @classmethod
+    def _auth_failure(
+        cls, response: httpx.Response, *, code: str, detail: str
+    ) -> ApiError:
+        """Échec GoTrue : la raison donnée par Supabase (SMTP, quota
+        d'e-mails, ...) est journalisée et renvoyée au backoffice."""
+        body = cls._auth_error_body(response)
+        upstream_message = str(
+            body.get("msg")
+            or body.get("message")
+            or body.get("error_description")
+            or ""
+        )[:300]
+        logger.warning(
+            "GoTrue %s: %s %s %s",
+            code,
+            response.status_code,
+            body.get("error_code") or "",
+            upstream_message,
+        )
+        return ApiError(
+            status_code=503,
+            code=code,
+            detail=detail,
+            context={
+                "upstream_status": response.status_code,
+                "upstream_code": str(body.get("error_code") or ""),
+                "upstream_message": upstream_message,
+            },
+        )
 
     @staticmethod
     def _auth_error_body(response: httpx.Response) -> dict:
