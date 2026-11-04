@@ -175,6 +175,22 @@ class SupabaseGateway:
         if not response.is_success:
             raise self._service_error(response)
 
+    async def service_update(
+        self, path: str, *, params: dict[str, str], payload: dict
+    ) -> None:
+        """Mise à jour avec la clé serveur, filtrée par `params` (PostgREST)."""
+        headers = self._service_headers()
+        headers["Prefer"] = "return=minimal"
+        response = await self._client.patch(
+            self._rest_url(path),
+            params=params,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if not response.is_success:
+            raise self._service_error(response)
+
     async def service_rpc(
         self, function_name: str, *, payload: dict, request_timeout: float = 30
     ) -> Any:

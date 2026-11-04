@@ -8,6 +8,12 @@ api.evoranq.com {
 		Referrer-Policy no-referrer
 	}
 
+	# Formulaire public des demandes de démo : quelques champs seulement. Un
+	# corps plus gros est refusé (413) avant d'atteindre l'API.
+	@demo_requests path /api/v1/demo-requests
+	request_body @demo_requests {
+		max_size 16KB
+	}
 	reverse_proxy 127.0.0.1:8010
 
 	log {

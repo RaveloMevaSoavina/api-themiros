@@ -27,6 +27,25 @@ class Settings(BaseSettings):
     # Backoffice : page du dashboard où mène le lien d'une invitation. Vide :
     # le Site URL de Supabase Auth.
     invitation_redirect_url: str | None = None
+    # Demandes de démo de la landing page (POST /api/v1/demo-requests).
+    # Chaque demande est enregistrée dans `demo_requests` ; l'e-mail à
+    # l'équipe part par Resend. Sans clé ou sans destinataire, rien n'est
+    # envoyé : la demande reste visible dans le backoffice (« Non notifiée »).
+    resend_api_key: str | None = Field(default=None, repr=False)
+    demo_request_mail_to: str = ""
+    # Domaine vérifié chez Resend (SPF + DKIM).
+    demo_request_mail_from: str | None = None
+    # Lien vers l'écran de suivi dans l'e-mail (facultatif).
+    backoffice_url: str | None = None
+    demo_request_rate_limit: int = Field(default=3, ge=1, le=100)
+    demo_request_rate_window_seconds: int = Field(default=600, ge=60, le=86400)
+    # Garde anti-robots en mémoire (app/modules/demo_requests/guard.py) :
+    # toute tentative compte, valide ou non ; au-delà, l'adresse est bannie.
+    demo_request_attempt_limit: int = Field(default=10, ge=1, le=1000)
+    demo_request_attempt_window_seconds: int = Field(default=600, ge=60, le=86400)
+    demo_request_ban_seconds: int = Field(default=3600, ge=60, le=604800)
+    # Demandes enregistrées par heure, toutes adresses confondues.
+    demo_request_global_limit: int = Field(default=30, ge=1, le=10000)
     ai_provider: Literal["disabled", "openai"] = "disabled"
     openai_api_key: str | None = Field(default=None, repr=False)
     openai_model: str = "gpt-6-astra"
@@ -106,6 +125,14 @@ class Settings(BaseSettings):
             origin.strip()
             for origin in self.cors_allowed_origins.split(",")
             if origin.strip()
+        ]
+
+    @property
+    def demo_request_recipients(self) -> list[str]:
+        return [
+            address.strip()
+            for address in self.demo_request_mail_to.split(",")
+            if address.strip()
         ]
 
     @computed_field

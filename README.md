@@ -154,6 +154,61 @@ Each export is recorded in `audit_events` (`report_exported`, or
 `report_export_failed`) with its format, run, author and timestamp; an
 export that cannot be recorded fails.
 
+## Demandes de démo (landing page)
+
+`POST /api/v1/demo-requests` reçoit le formulaire de
+`landing-page/request-demo.html`. Route **publique**, sans jeton.
+
+1. Valide les champs (`name`, `organisation`, `email` obligatoires ;
+   `context`, `source` facultatifs) : 422 sinon.
+2. Honeypot `website` rempli : 201 sans rien stocker ni envoyer.
+3. Au plus `DEMO_REQUEST_RATE_LIMIT` demandes enregistrées (3) par adresse
+   IP sur `DEMO_REQUEST_RATE_WINDOW_SECONDS` (600), vérifié en base : 429
+   au-delà. L'adresse est la dernière entrée de `X-Forwarded-For`, posée par
+   Caddy.
+4. Enregistre la demande dans `public.demo_requests` (clé serveur).
+5. Prévient l'équipe par e-mail via Resend (`Reply-To` : le demandeur), puis
+   passe `notified` à vrai.
+
+### Anti-robots
+
+En plus de la limite en base, un garde en mémoire
+(`app/modules/demo_requests/guard.py`) filtre la route avant même la lecture
+du corps :
+
+| Barrière            | Règle par défaut                                                           | Réponse                          |
+| ------------------- | -------------------------------------------------------------------------- | -------------------------------- |
+| Tentatives par IP   | Toute requête compte (valide, invalide, honeypot) : plus de `DEMO_REQUEST_ATTEMPT_LIMIT` (10) en `DEMO_REQUEST_ATTEMPT_WINDOW_SECONDS` (600) bannit l'adresse `DEMO_REQUEST_BAN_SECONDS` (3 600). | 429 `DEMO_REQUEST_BLOCKED`       |
+| Honeypot            | L'adresse est bannie d'office ; la requête piégée reçoit quand même 201.  | 429 aux suivantes                |
+| Plafond global      | Au plus `DEMO_REQUEST_GLOBAL_LIMIT` (30) demandes enregistrées par heure, toutes adresses confondues (robot réparti sur plusieurs IP). | 429 `DEMO_REQUEST_GLOBAL_LIMIT`  |
+| Taille du corps     | 16 Kio, dans Caddy (`deploy/Caddyfile.api`) et dans l'API.                | 413                              |
+
+En IPv6, la clé est le préfixe /64, qu'un abonné peut faire tourner à
+volonté. Les compteurs vivent dans le processus (uvicorn en a un seul) : un
+redémarrage les remet à zéro, la limite en base reste. Les bannissements
+sont journalisés (`Demo requests: … blocked`). Le garde est installé avant le
+CORS pour que ses 429 portent les en-têtes CORS : le formulaire affiche
+alors « patientez quelques minutes » et non l'échec générique.
+
+Si l'e-mail échoue ou n'est pas configuré, la demande reste enregistrée et
+la réponse est un succès : le backoffice (`/demo-requests`) la marque
+« Non notifiée ».
+
+Réglages (`.env.production`) :
+
+| Variable                  | Rôle                                                       |
+| ------------------------- | ---------------------------------------------------------- |
+| `CORS_ALLOWED_ORIGINS`    | Doit contenir l'origine de la landing (`https://themiros.com`, `https://www.themiros.com`). |
+| `RESEND_API_KEY`          | Clé Resend. Vide : aucun e-mail.                           |
+| `DEMO_REQUEST_MAIL_TO`    | Destinataires, séparés par des virgules.                   |
+| `DEMO_REQUEST_MAIL_FROM`  | Expéditeur, sur un domaine vérifié chez Resend.           |
+| `BACKOFFICE_URL`          | Facultatif : lien vers l'écran de suivi dans l'e-mail.    |
+
+Prérequis : la table `demo_requests`
+(`landing-page/supabase/migrations/20260918000001_demo_requests.sql`) et,
+pour le suivi, la migration
+`dashboard-themiros/supabase/migrations/20261104000001_backoffice_demo_requests.sql`.
+
 ## Tests and quality
 
 ```bash
