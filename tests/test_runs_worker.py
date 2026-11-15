@@ -22,6 +22,7 @@ from app.modules.runs.layer_b import (
     SubQuestion,
 )
 from app.modules.runs.layer_c import LayerCInputs, PillarCriterion, RawQualification
+from app.modules.runs.project import ProjectContext
 from app.modules.runs.repository import ClaimedRun
 from app.modules.runs.restitution import (
     RawAction,
@@ -88,6 +89,10 @@ class FakeRepository:
         self.layer_c_value = LayerCInputs(locale="fr", pillar_names={}, links=())
         self.text_requests: list[list[UUID]] = []
         self.texts: dict[UUID, str] = {}
+        self.project_value = ProjectContext(name="Résilience Sahel", kind="project")
+
+    async def project(self, run):
+        return self.project_value
 
     async def layer_c_inputs(self, run):
         return self.layer_c_value
@@ -139,7 +144,7 @@ async def test_empty_queue_does_nothing() -> None:
     repository = FakeRepository([], _inputs())
     assert await _worker(repository).run_once() is False
     assert repository.claims == [
-        ("host-1#runs", "layer-a/1.0.0+layer-b/1.1.0+layer-c/1.0.0+restitution/1.4.0")
+        ("host-1#runs", "layer-a/1.0.0+layer-b/1.2.0+layer-c/1.1.0+restitution/1.5.0")
     ]
 
 
@@ -255,9 +260,11 @@ class FakeGrader:
         self.error = error
         self.note = note
         self.calls = 0
+        self.batches: list = []
 
     async def grade(self, prompt, batch):
         self.calls += 1
+        self.batches.append(batch)
         if self.error:
             raise self.error
         return (
@@ -304,6 +311,8 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     await _layer_b_worker(repository, grader).run_once()
 
     assert grader.calls == 1
+    # Le projet évalué accompagne le message : les textes parlent de lui.
+    assert grader.batches[0].content["pj"] == {"n": "Résilience Sahel", "t": "project"}
     steps = [(name, status) for name, status, _ in repository.steps]
     assert ("layer_b", "running") in steps and ("layer_b", "completed") in steps
     assert ("layer_c", "completed") in steps
@@ -315,7 +324,7 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     assert len(results["layer_b"]["evidences"]) == 2
     ai = results["rules"]["layer_b"]["ai"]
     assert ai["status"] == "completed" and ai["calls"] == 1
-    assert ai["prompt"] == "grade_sub_questions_v1.1"
+    assert ai["prompt"] == "grade_sub_questions_v1.2"
     assert (ai["input_tokens"], ai["output_tokens"]) == (1200, 80)
     summary = next(
         s for n, st, s in repository.steps if (n, st) == ("layer_b", "completed")
@@ -460,6 +469,7 @@ async def test_layer_c_qualifies_every_gap_in_a_single_ai_call() -> None:
     await _layer_c_worker(repository, qualifier).run_once()
 
     assert len(qualifier.batches) == 1
+    assert qualifier.batches[0].content["pj"]["n"] == "Résilience Sahel"
     # Les extraits de la couche B sont déjà lus ; seuls ceux de la couche A
     # sont demandés.
     (requested,) = repository.text_requests
@@ -473,8 +483,8 @@ async def test_layer_c_qualifies_every_gap_in_a_single_ai_call() -> None:
     assert len(alert["segment_ids"]) == 1
     ai = results["rules"]["layer_c"]["ai"]
     assert ai["status"] == "completed" and ai["calls"] == 1
-    assert ai["prompt"] == "detect_incoherence_v1.0"
-    assert results["rules"]["layer_c"]["engine_version"] == "layer-c/1.0.0"
+    assert ai["prompt"] == "detect_incoherence_v1.1"
+    assert results["rules"]["layer_c"]["engine_version"] == "layer-c/1.1.0"
     summary = next(
         s for n, st, s in repository.steps if (n, st) == ("layer_c", "completed")
     )
@@ -593,6 +603,7 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     await _restitution_worker(repository, writer).run_once()
 
     assert len(writer.batches) == 1
+    assert writer.batches[0].content["pj"]["n"] == "Résilience Sahel"
     (results,) = repository.completed
     restitution = results["restitution"]
     # Pertinence (note 1) est une faiblesse ; l'alerte ALERT-01 est à vérifier.
@@ -610,9 +621,9 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     ]
     assert all(len(action["projections"]) == 3 for action in restitution["actions"])
     rules = results["rules"]["restitution"]
-    assert rules["engine_version"] == "restitution/1.4.0"
+    assert rules["engine_version"] == "restitution/1.5.0"
     assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
-    assert rules["ai"]["prompt"] == "formulate_restitution_v1.3"
+    assert rules["ai"]["prompt"] == "formulate_restitution_v1.4"
     assert results["summary"]["actions"] == 2
     assert repository.failures == []
 
@@ -665,3 +676,18 @@ async def test_an_empty_restitution_needs_no_ai_call() -> None:
     assert results["restitution"]["items"] == []
     assert results["restitution"]["synthesis"]["status"] == "not_needed"
     assert results["rules"]["restitution"]["ai"]["status"] == "not_needed"
+
+
+async def test_a_missing_project_context_does_not_fail_the_run() -> None:
+    repository = _layer_b_repository()
+
+    async def unavailable(run):
+        raise ApiError(status_code=404, code="NOT_FOUND", detail="introuvable")
+
+    repository.project = unavailable
+    grader = FakeGrader()
+
+    await _layer_b_worker(repository, grader).run_once()
+
+    assert "pj" not in grader.batches[0].content
+    assert len(repository.completed) == 1 and repository.failures == []

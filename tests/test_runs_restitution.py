@@ -551,13 +551,16 @@ def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
                 },
             ),
         ),
-        readings={"E1": "Le taux d'exécution budgétaire est élevé.", "E9": "?"},
+        readings={
+            "E1": "Le projet exécute bien son budget [E1.1, E2].",
+            "E9": "?",
+        },
         translations={
             "en": RawTranslation(
                 items={"P1": "Execution improves [E1.2]."},
                 conclusion="Execution reaches 85% [E4, E1.1].\n\nMonitoring [E2].",
                 actions={},
-                readings={"E1": "The budget execution rate is high."},
+                readings={"E1": "The project executes its budget well [E1.1]."},
             )
         },
     )
@@ -588,8 +591,10 @@ def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
     assert action.projections[0].justification == "les besoins ne sont pas analysés⟦1⟧"
     assert action.segment_ids == [PERTINENCE_SEGMENT]
     reading = restitution.readings[BUDGET_SEGMENT]
-    assert reading.text == "Le taux d'exécution budgétaire est élevé."
-    assert reading.translations == {"en": "The budget execution rate is high."}
+    # Ses sources : ses propres phrases seulement (E2 disparaît).
+    assert reading.text == "Le projet exécute bien son budget⟦1⟧."
+    assert reading.translations == {"en": "The project executes its budget well⟦1⟧."}
+    assert reading.citations == [Source(BUDGET_SEGMENT, (budget.spans[0],))]
     # Phrases citées de l'extrait par tous les textes : V1 le cite entier.
     assert reading.spans == ((budget.spans[0][0], budget.spans[-1][1]),)
 
@@ -607,8 +612,11 @@ def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
     assert payload["readings"] == [
         {
             "segment_id": str(BUDGET_SEGMENT),
-            "interpretation": "Le taux d'exécution budgétaire est élevé.",
-            "translations": {"en": "The budget execution rate is high."},
+            "interpretation": "Le projet exécute bien son budget⟦1⟧.",
+            "translations": {"en": "The project executes its budget well⟦1⟧."},
+            "interpretation_citations": [
+                {"segment_id": str(BUDGET_SEGMENT), "spans": [list(budget.spans[0])]}
+            ],
             "spans": [[budget.spans[0][0], budget.spans[-1][1]]],
         }
     ]

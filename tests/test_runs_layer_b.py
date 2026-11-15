@@ -16,6 +16,7 @@ from app.modules.runs.layer_b import (
     retrieve,
     truncate,
 )
+from app.modules.runs.project import ProjectContext
 
 RULES = LayerBRules(min_similarity=0.4)
 DOCUMENTS = [uuid4(), uuid4()]
@@ -305,7 +306,11 @@ def test_cited_sentences_and_readings_follow_each_evidence() -> None:
     raw = RawGrading(
         grades=(
             RawGrade(
-                "Q1", 3, ("E1.2",), False, {"E1.2": "Le plan est validé.", "E7": "?"}
+                "Q1",
+                3,
+                ("E1.2",),
+                False,
+                {"E1.2": "Le projet fait valider son plan [E1.2, E3].", "E7": "?"},
             ),
         ),
         justifications={"C1": "Le plan est validé chaque année [E1.2, E5]."},
@@ -318,7 +323,12 @@ def test_cited_sentences_and_readings_follow_each_evidence() -> None:
     second = (text.index("Le comité"), len(text))
     (answer,) = results.answers
     assert answer.spans == {segment: (second,)}
-    assert answer.readings == {segment: "Le plan est validé."}
+    # Une interprétation ne cite que ses propres phrases : E3 disparaît.
+    reading = answer.readings[segment]
+    assert reading.text == "Le projet fait valider son plan⟦1⟧."
+    assert [source.as_dict() for source in reading.citations] == [
+        {"segment_id": str(segment), "spans": [list(second)]}
+    ]
     (note,) = results.notes
     # E5 n'est pas un extrait du critère : seule la source E1.2 reste.
     assert note.justification == "Le plan est validé chaque année⟦1⟧."
@@ -326,8 +336,72 @@ def test_cited_sentences_and_readings_follow_each_evidence() -> None:
         {"segment_id": str(segment), "spans": [list(second)]}
     ]
     payload = results.payload()
-    assert payload["evidences"][0]["interpretation"] == "Le plan est validé."
+    assert (
+        payload["evidences"][0]["interpretation"]
+        == "Le projet fait valider son plan⟦1⟧."
+    )
+    assert payload["evidences"][0]["interpretation_citations"] == [
+        {"segment_id": str(segment), "spans": [list(second)]}
+    ]
     assert payload["evidences"][0]["spans"] == [list(second)]
     assert payload["notes"][0]["citations"] == [
         {"segment_id": str(segment), "spans": [list(second)]}
     ]
+
+
+def test_a_reading_without_source_points_to_the_sentences_of_its_grade() -> None:
+    criterion = _criterion("Pertinence", 1)
+    question = criterion.questions[0]
+    text = "Le projet cible trois régions. Le comité valide le plan chaque année."
+    segment = uuid4()
+    retrieved = retrieve(
+        [Candidate(question.id, segment, DOCUMENTS[0], 0.6, text)], RULES
+    )
+    (batch,) = build_batches(_inputs(criterion), retrieved, RULES)
+    raw = RawGrading(
+        grades=(RawGrade("Q1", 2, ("E1.1",), False, {"E1": "Le projet est ciblé."}),),
+        justifications={},
+    )
+    grading = Grading()
+
+    interpret(batch, raw, grading)
+
+    reading = grading.grades[question.id].readings[segment]
+    # Le marqueur, ajouté avant la ponctuation, mène à la phrase de la note.
+    assert reading.text == "Le projet est ciblé⟦1⟧."
+    assert [source.spans for source in reading.citations] == [
+        ((0, text.index(" Le comité")),)
+    ]
+
+
+def test_the_evaluated_project_goes_with_the_message() -> None:
+    criterion = _criterion("Pertinence", 1)
+    question = criterion.questions[0]
+    retrieved = retrieve([_candidate(question)], RULES)
+    project = ProjectContext.from_row(
+        {
+            "name": "Résilience Sahel",
+            "kind": "project",
+            "description": "  Irrigation   et stockage. ",
+            "country": "Niger",
+            "financiers": ["FIDA", "FIDA", ""],
+            "themes": [],
+            "start_year": 2021,
+            "end_year": 2026,
+        }
+    )
+    inputs = LayerBInputs("fr", "mi_parcours", (criterion,), project)
+
+    (batch,) = build_batches(inputs, retrieved, RULES)
+
+    assert batch.content["pj"] == {
+        "n": "Résilience Sahel",
+        "t": "project",
+        "d": "Irrigation et stockage.",
+        "pa": "Niger",
+        "f": ["FIDA"],
+        "an": "2021-2026",
+    }
+    # Sans projet connu, le message n'a pas de bloc pj.
+    (bare,) = build_batches(_inputs(criterion), retrieved, RULES)
+    assert "pj" not in bare.content

@@ -16,6 +16,7 @@ from app.modules.ingestion.repository import vector_literal
 from app.modules.runs.domain import RunInputs
 from app.modules.runs.layer_b import Candidate, LayerBInputs
 from app.modules.runs.layer_c import LayerCInputs
+from app.modules.runs.project import ProjectContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +104,13 @@ class RunRepository:
             "run_layer_c_inputs", payload=self._lease(run), request_timeout=60
         )
         return LayerCInputs.from_row(row or {})
+
+    async def project(self, run: ClaimedRun) -> ProjectContext:
+        """Le projet évalué : situe les extraits dans les prompts du run."""
+        row = await self._gateway.service_rpc(
+            "run_project_context", payload=self._lease(run), request_timeout=60
+        )
+        return ProjectContext.from_row(row if isinstance(row, dict) else None)
 
     async def segment_texts(
         self, run: ClaimedRun, segment_ids: list[UUID]

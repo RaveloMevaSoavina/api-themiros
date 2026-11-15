@@ -196,6 +196,72 @@ def compact(
     return renumbered, kept
 
 
+@dataclass(slots=True)
+class Reading:
+    """Interprétation d'un extrait : ce qu'il établit sur le projet, ses
+    marqueurs « ⟦1⟧ » renvoyant à ses propres phrases (`citations`), ses
+    traductions (mêmes numéros), et toutes ses phrases citées (`spans`)."""
+
+    text: str
+    spans: tuple[Span, ...] = ()
+    translations: dict[str, str] = field(default_factory=dict)
+    citations: list[Source] = field(default_factory=list)
+
+
+def read(
+    key: str,
+    text: str | None,
+    translated: Mapping[str, str | None],
+    excerpts: Mapping[str, Excerpt],
+    limit: int,
+    max_chars: int,
+    fallback: Sequence[Span] = (),
+) -> Reading | None:
+    """Interprétation de l'extrait `key` : ses sources ne peuvent être que
+    ses propres phrases (« [E1.2] ») ; une référence à un autre extrait
+    disparaît. Sans source valable, elle renvoie aux phrases `fallback`
+    (celles que les autres textes citent), à défaut à l'extrait entier :
+    une interprétation mène toujours au passage surligné. `None` si le
+    texte est vide."""
+    if not text or not text.strip() or key not in excerpts:
+        return None
+    allowed = (key,)
+    citations = Citations(excerpts)
+    original = truncate(citations.cite(text, allowed), limit)
+    versions = {
+        locale: truncate(citations.cite(value, allowed), limit)
+        for locale, value in translated.items()
+        if value and value.strip()
+    }
+    locales = list(versions)
+    texts, sources = compact(
+        [original, *(versions[locale] for locale in locales)], citations.sources
+    )
+    if not sources:
+        item = excerpts[key]
+        sources = [Source(item.segment_id, tuple(merge(fallback or item.spans)))]
+        texts = [_marked(value) if value else value for value in texts]
+    return Reading(
+        text=fit(texts[0] or "", max_chars),
+        translations={
+            locale: fit(value or "", max_chars)
+            for locale, value in zip(locales, texts[1:], strict=True)
+            if value
+        },
+        citations=sources,
+    )
+
+
+_END = re.compile(r"([.!?…]*)\s*$")
+
+
+def _marked(text: str) -> str:
+    """Le texte suivi du marqueur « ⟦1⟧ », avant sa ponctuation finale."""
+    match = _END.search(text)
+    assert match is not None
+    return text[: match.start()].rstrip() + OPEN + "1" + CLOSE + match.group(1)
+
+
 def plain(text: str | None) -> str:
     """Le texte sans ses marqueurs (exports, longueur affichée)."""
     return MARKER.sub("", text or "")

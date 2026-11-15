@@ -21,7 +21,9 @@ Déroulé, pour un run :
    courts (A1, E1). Plusieurs appels seulement au-delà du plafond ;
 3. `interpret` : l'IA confirme ou infirme chaque écart, fixe sa gravité et
    rédige son message en citant des extraits proposés pour lui. Un écart
-   infirmé n'est pas publié.
+   infirmé n'est pas publié. Le projet évalué (`pj`) accompagne le
+   message : l'IA dit ce qu'il faut vérifier dans le projet, pas l'écart
+   entre un score et une note.
 
 Sans IA (désactivée, en erreur, plafond de coût), les écarts détectés sont
 publiés avec leur gravité par défaut et le libellé de leur règle, marqués
@@ -39,16 +41,18 @@ from uuid import UUID, uuid4
 
 from app.modules.runs.domain import LayerAResults, PillarScore
 from app.modules.runs.layer_b import LayerBResults, truncate
+from app.modules.runs.project import ProjectContext
 
-LAYER_C_VERSION = "layer-c/1.0.0"
+LAYER_C_VERSION = "layer-c/1.1.0"
 PROMPT_CODE = "detect_incoherence"
-PROMPT_VERSION = "v1.0"
+# v1.1 : le projet évalué (`pj`), sujet des messages.
+PROMPT_VERSION = "v1.1"
 
 Severity = Literal["mineure", "majeure"]
 
 # Mêmes estimations que la couche B (~3 caractères par token).
 CHARS_PER_TOKEN = 3
-SYSTEM_PROMPT_TOKENS = 600
+SYSTEM_PROMPT_TOKENS = 800
 OUTPUT_TOKENS_PER_ALERT = 90
 MESSAGE_CHARS = 200
 STORED_MESSAGE_CHARS = 300
@@ -113,6 +117,7 @@ class LayerCInputs:
     locale: str
     pillar_names: Mapping[UUID, str]
     links: tuple[PillarCriterion, ...]
+    project: ProjectContext = field(default_factory=ProjectContext)
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "LayerCInputs":
@@ -496,7 +501,10 @@ def build_batches(
     """Lots d'appels IA : un seul en pratique. Un lot est fermé quand
     l'écart suivant ferait dépasser le plafond d'entrée ou de sortie."""
     batches: list[QualificationBatch] = []
-    current = QualificationBatch(content={"lang": inputs.locale})
+    header: dict[str, Any] = {"lang": inputs.locale}
+    if project := inputs.project.prompt():
+        header["pj"] = project
+    current = QualificationBatch(content=dict(header))
     for alert in alerts:
         key = f"A{len(current.alerts) + 1}"
         entry, added = _entry(current, key, alert, texts, rules)
@@ -510,7 +518,7 @@ def build_batches(
             > rules.max_output_tokens
         ):
             batches.append(current)
-            current = QualificationBatch(content={"lang": inputs.locale})
+            current = QualificationBatch(content=dict(header))
             entry, added = _entry(current, "A1", alert, texts, rules)
         _add(current, alert, entry, added)
     if current.alerts:

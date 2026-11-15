@@ -13,9 +13,11 @@ Déroulé, pour un run :
 3. `interpret` : une sous-question n'est documentée que si l'IA lui donne une
    note en citant au moins un de ses propres extraits (GF-1, RG-4). L'IA
    cite des phrases (E1.2) : la preuve garde leurs positions, que le
-   surlignage reprend, et une phrase d'interprétation de l'extrait pour la
-   sous-question. La justification du critère cite ses sources dans le
-   texte (`citations`) ;
+   surlignage reprend, et une phrase d'interprétation de l'extrait : ce
+   qu'il établit sur le projet, avec ses propres phrases pour sources
+   (`Reading`). La justification du critère cite ses sources dans le texte
+   (`citations`). Le projet évalué (`pj`) accompagne le message : les
+   textes parlent de lui, pas des critères ni des notes ;
 4. `finalize` : note du critère = moyenne des notes des sous-questions
    documentées, si au moins 50 % le sont ; ambiguïté si les extraits se
    contredisent ou si les notes sont dispersées (RG-3).
@@ -38,19 +40,24 @@ from app.modules.evidences.passages import Span, merge
 from app.modules.runs.citations import (
     Citations,
     Excerpt,
+    Reading,
     Source,
     cited,
     compact,
     excerpt,
     fit,
+    read,
 )
 from app.modules.runs.citations import truncate as truncate_cited
+from app.modules.runs.project import ProjectContext
 
-LAYER_B_VERSION = "layer-b/1.1.0"
+LAYER_B_VERSION = "layer-b/1.2.0"
 PROMPT_CODE = "grade_sub_questions"
 # v1.1 : extraits en phrases, phrases citées, interprétation de chaque
-# extrait cité, sources dans la justification.
-PROMPT_VERSION = "v1.1"
+# extrait cité, sources dans la justification. v1.2 : le projet évalué
+# (`pj`), sujet des justifications et des interprétations, qui citent
+# leurs phrases.
+PROMPT_VERSION = "v1.2"
 
 NoteStatus = Literal["conclu", "non_conclu"]
 AnswerStatus = Literal["documentee", "non_documentee"]
@@ -58,7 +65,7 @@ AnswerStatus = Literal["documentee", "non_documentee"]
 # Tokens estimés : ~3 caractères par token pour du français en JSON compact
 # (estimation prudente), plus le prompt système.
 CHARS_PER_TOKEN = 3
-SYSTEM_PROMPT_TOKENS = 700
+SYSTEM_PROMPT_TOKENS = 950
 # Note, extraits cités et leur interprétation (une phrase chacun).
 OUTPUT_TOKENS_PER_QUESTION = 120
 OUTPUT_TOKENS_PER_CRITERION = 150
@@ -67,8 +74,10 @@ EXPECTED_EVIDENCE_CHARS = 160
 JUSTIFICATION_CHARS = 600
 # Plafond de la base pour une justification, marqueurs compris.
 JUSTIFICATION_MAX_CHARS = 1000
-# Le prompt (v1.1) demande 160 caractères.
+# Le prompt (v1.2) demande 160 caractères hors sources.
 READING_CHARS = 220
+# Plafond de la base pour une interprétation, marqueurs compris.
+READING_MAX_CHARS = 400
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +117,7 @@ class LayerBInputs:
     locale: str
     cycle: str
     criteria: tuple[Criterion, ...]
+    project: ProjectContext = field(default_factory=ProjectContext)
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "LayerBInputs":
@@ -172,7 +182,7 @@ class Grade:
     contradictory: bool
     # Par segment cité : positions des phrases citées, interprétation.
     spans: Mapping[UUID, tuple[Span, ...]] = field(default_factory=dict)
-    readings: Mapping[UUID, str] = field(default_factory=dict)
+    readings: Mapping[UUID, Reading] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +248,7 @@ class SubAnswerResult:
     criterion_id: UUID | None = None
     # Par segment cité : positions des phrases citées, interprétation.
     spans: Mapping[UUID, tuple[Span, ...]] = field(default_factory=dict)
-    readings: Mapping[UUID, str] = field(default_factory=dict)
+    readings: Mapping[UUID, Reading] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -302,7 +312,7 @@ class LayerBResults:
                     "sub_answer_id": str(answer.id),
                     "segment_id": str(candidate.segment_id),
                     "similarity": candidate.similarity,
-                    "interpretation": answer.readings.get(candidate.segment_id),
+                    **_reading(answer.readings.get(candidate.segment_id)),
                     "spans": (
                         [list(span) for span in answer.spans[candidate.segment_id]]
                         if answer.spans.get(candidate.segment_id)
@@ -313,6 +323,16 @@ class LayerBResults:
                 for candidate in answer.evidences
             ],
         }
+
+
+def _reading(reading: Reading | None) -> dict[str, Any]:
+    """Interprétation d'une preuve et ses sources (ses propres phrases)."""
+    if reading is None:
+        return {"interpretation": None, "interpretation_citations": []}
+    return {
+        "interpretation": reading.text,
+        "interpretation_citations": [source.as_dict() for source in reading.citations],
+    }
 
 
 def retrieve(
@@ -440,9 +460,10 @@ def _with_criterion(
     }
     if criterion.definition:
         entry["d"] = truncate(criterion.definition, DEFINITION_CHARS)
-    content = {
-        "lang": inputs.locale,
-        "cycle": inputs.cycle,
+    content: dict[str, Any] = {"lang": inputs.locale, "cycle": inputs.cycle}
+    if project := inputs.project.prompt():
+        content["pj"] = project
+    content |= {
         "x": excerpts,
         "c": [*batch.content.get("c", []), entry],
     }
@@ -482,13 +503,23 @@ def interpret(batch: GradingBatch, raw: RawGrading, grading: Grading) -> None:
         )
         if not found:
             continue
-        readings: dict[UUID, str] = {}
+        readings: dict[UUID, Reading] = {}
         for reference, text in raw_grade.readings.items():
             key = next(iter(cited([reference], batch.excerpts)), None)
-            if key in found and text and text.strip():
-                readings.setdefault(
-                    batch.excerpt_keys[key], truncate(text, READING_CHARS)
-                )
+            if key not in found or batch.excerpt_keys[key] in readings:
+                continue
+            reading = read(
+                key,
+                text,
+                {},
+                batch.excerpts,
+                READING_CHARS,
+                READING_MAX_CHARS,
+                fallback=found[key],
+            )
+            if reading is not None:
+                reading.spans = tuple(merge(found[key]))
+                readings[batch.excerpt_keys[key]] = reading
         grading.grades[question_id] = Grade(
             raw_grade.note,
             tuple(batch.excerpt_keys[key] for key in found),

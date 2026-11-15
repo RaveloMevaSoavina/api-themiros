@@ -12,6 +12,7 @@ factuels, sans conclusion ni plan d'action.
 import asyncio
 import contextlib
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -57,6 +58,7 @@ from app.modules.runs.layer_c import PROMPT_CODE as ALERT_PROMPT_CODE
 from app.modules.runs.layer_c import PROMPT_VERSION as ALERT_PROMPT_VERSION
 from app.modules.runs.layer_c import build_batches as build_alert_batches
 from app.modules.runs.layer_c import interpret as interpret_alerts
+from app.modules.runs.project import ProjectContext
 from app.modules.runs.repository import ClaimedRun, RunRepository
 from app.modules.runs.restitution import PROMPT_CODE as RESTITUTION_PROMPT_CODE
 from app.modules.runs.restitution import PROMPT_VERSION as RESTITUTION_PROMPT_VERSION
@@ -191,13 +193,14 @@ class RunWorker:
 
             step = "layer_b"
             payload = results.payload(rules)
+            project = await self._project(run)
             layer_b: LayerBResults | None = None
             if self._embedder is None:
                 await self._repository.step(run, step, "skipped", NOT_AVAILABLE)
             else:
                 await self._repository.step(run, step, "running")
                 layer_b_rules = self.layer_b_rules()
-                layer_b = await self._layer_b(run, layer_b_rules)
+                layer_b = await self._layer_b(run, layer_b_rules, project)
                 await self._repository.step(run, step, "completed", layer_b.summary())
                 payload["layer_b"] = layer_b.payload()
                 payload["rules"] = {
@@ -207,7 +210,9 @@ class RunWorker:
 
             step = "layer_c"
             await self._repository.step(run, step, "running")
-            layer_c_inputs = await self._repository.layer_c_inputs(run)
+            layer_c_inputs = replace(
+                await self._repository.layer_c_inputs(run), project=project
+            )
             layer_c_rules = LayerCRules()
             layer_c = await self._layer_c(
                 run, layer_c_inputs, results, layer_b, layer_c_rules
@@ -268,9 +273,21 @@ class RunWorker:
             except Exception:
                 logger.exception("Unable to record the failure of run %s", run.run_id)
 
-    async def _layer_b(self, run: ClaimedRun, rules: LayerBRules) -> LayerBResults:
+    async def _project(self, run: ClaimedRun) -> ProjectContext:
+        """Le projet évalué ; introuvable, les prompts s'en passent."""
+        try:
+            return await self._repository.project(run)
+        except ApiError as error:
+            if error.code == "RUN_LEASE_LOST":
+                raise
+            logger.warning("Run %s: project context unavailable", run.run_id)
+            return ProjectContext()
+
+    async def _layer_b(
+        self, run: ClaimedRun, rules: LayerBRules, project: ProjectContext
+    ) -> LayerBResults:
         assert self._embedder is not None
-        inputs = await self._repository.layer_b_inputs(run)
+        inputs = replace(await self._repository.layer_b_inputs(run), project=project)
         queries = inputs.queries()
         candidates = []
         if queries:
@@ -466,7 +483,9 @@ class RunWorker:
             )
         )
         texts.update(await self._repository.segment_texts(run, missing))
-        batch = build_restitution_batch(inputs.locale, restitution, texts, rules)
+        batch = build_restitution_batch(
+            inputs.locale, restitution, texts, rules, inputs.project
+        )
         assert batch is not None
         usages: list[AiUsage] = []
         try:
