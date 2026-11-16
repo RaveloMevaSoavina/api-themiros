@@ -122,6 +122,38 @@ def test_segments_track_sections_and_pages() -> None:
     assert budget.char_start >= 5000
 
 
+def test_pdf_section_continues_on_the_next_page() -> None:
+    pages = [
+        PageText(1, "3.2 Mise en oeuvre\n" + "Les activités avancent. " * 30, 0),
+        PageText(2, "Les travaux se poursuivent. " * 30, 2000),
+    ]
+    segments = segment_pages(pages)
+    assert {segment.section_title for segment in segments} == {"3.2 Mise en oeuvre"}
+    # La page suivante prolonge le segment au lieu d'en ouvrir un nouveau.
+    assert len(segments) == 1
+    assert "Les travaux se poursuivent." in segments[0].text
+
+
+def test_sheet_or_document_title_still_opens_its_section() -> None:
+    pages = [
+        PageText(1, "Le budget de l'année. " * 30, 0, section_title="Budget"),
+        PageText(2, "Les indicateurs suivis. " * 30, 2000, section_title="Suivi"),
+    ]
+    segments = segment_pages(pages)
+    assert [segment.section_title for segment in segments] == ["Budget", "Suivi"]
+
+
+def test_heading_without_content_opens_the_next_section_segment() -> None:
+    text = "3. RÉSULTATS\n\n3.1 Activités agricoles\n\n" + (
+        "Les parcelles irriguées progressent. " * 30
+    )
+    segments = segment_pages([PageText(1, text, 0)])
+    assert len(segments) == 1
+    assert segments[0].section_title == "3.1 Activités agricoles"
+    assert segments[0].text.startswith("3. RÉSULTATS\n3.1 Activités agricoles")
+    assert segments[0].char_start == 0
+
+
 def test_very_long_paragraph_is_split_by_sentence() -> None:
     long_paragraph = "Une phrase sur le suivi des indicateurs du programme. " * 400
     segments = segment_pages([PageText(1, long_paragraph, 0)])

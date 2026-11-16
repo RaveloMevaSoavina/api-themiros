@@ -7,7 +7,7 @@ consécutifs d'une même section.
 
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 
 import tiktoken
@@ -54,6 +54,7 @@ class _Unit:
     char_end: int
     section_title: str | None
     tokens: int
+    is_heading: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -117,10 +118,14 @@ def _split_lines(block: str) -> list[str]:
 def _units(pages: Iterable[PageText]) -> list[_Unit]:
     units: list[_Unit] = []
     paragraph_index = 0
+    section: str | None = None
     for page in pages:
-        section = page.section_title
+        # Une page sans titre propre (PDF) continue la section en cours ; une
+        # feuille XLSX ou un DOCX apporte le sien.
+        section = page.section_title or section
         for text, start, end in _paragraphs(page):
-            if is_heading(text):
+            heading = is_heading(text)
+            if heading:
                 section = text.strip()
             tokens = count_tokens(text)
             if tokens <= MAX_TOKENS:
@@ -133,6 +138,7 @@ def _units(pages: Iterable[PageText]) -> list[_Unit]:
                         end,
                         section,
                         tokens,
+                        heading,
                     )
                 )
             else:
@@ -222,10 +228,19 @@ def segment_pages(pages: Iterable[PageText]) -> list[Segment]:
 
     for unit in _units(pages):
         if chunk and unit.section_title != chunk[-1].section_title:
-            # Nouvelle section : pas de chevauchement entre sections.
-            flush(False)
-            _merge_small_tail(segments, chunk)
-            chunk, overlap, overlap_tokens = [], "", 0
+            if all(item.is_heading for item in chunk):
+                # Des titres sans contenu (« 3. RÉSULTATS » suivi de « 3.1
+                # Activités ») ouvrent le segment de la section suivante au
+                # lieu de former un segment à eux seuls.
+                chunk = [
+                    replace(item, section_title=unit.section_title) for item in chunk
+                ]
+                overlap, overlap_tokens = "", 0
+            else:
+                # Nouvelle section : pas de chevauchement entre sections.
+                flush(False)
+                _merge_small_tail(segments, chunk)
+                chunk, overlap, overlap_tokens = [], "", 0
         current = sum(item.tokens for item in chunk) + overlap_tokens
         if chunk and current + unit.tokens > TARGET_TOKENS:
             overlap = flush(True)

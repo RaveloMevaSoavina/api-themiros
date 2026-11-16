@@ -88,6 +88,23 @@ def test_pdf_tables_are_only_searched_on_pages_with_drawings(monkeypatch) -> Non
     assert "Irrigation | 120 000" in extracted.pages[1].text
 
 
+def test_pdf_table_cells_are_indexed_once_in_place() -> None:
+    document = pymupdf.open()
+    _table_page(document, [("Activite", "Budget"), ("Irrigation", "120 000")])
+    page = document[0]
+    page.insert_text((50, 420), "Source : rapport financier 2025.", fontsize=11)
+    text = extract_document(document.tobytes(), "budget.pdf").pages[0].text
+
+    assert text.count("Irrigation") == 1
+    assert text.count("120 000") == 1
+    # Le tableau garde sa place entre le paragraphe et la note qui le suit.
+    assert (
+        text.index("resilience")
+        < text.index("Irrigation | 120 000")
+        < text.index("Source : rapport")
+    )
+
+
 def test_pdf_type_follows_native_text_and_images() -> None:
     text = "x" * 300
     assert detect_pdf_type([text, text], [False, True]) == "natif"

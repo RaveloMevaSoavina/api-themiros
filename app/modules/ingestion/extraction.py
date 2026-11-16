@@ -142,9 +142,8 @@ def _extract_pdf(content: bytes, ocr: OcrOptions) -> ExtractedDocument:
             natives.append(text)
             has_images.append(bool(page.get_images()))
             # Un tableau sans texte natif n'a que des cellules vides.
-            tables = _pdf_tables(page) if text else ""
-            if tables:
-                text = f"{text}\n\n{tables}".strip()
+            if text:
+                text = _with_tables(page, text)
             pages.append(ExtractedPage(page_number=index + 1, text=text))
         pdf_type = detect_pdf_type(natives, has_images)
         to_ocr = [
@@ -172,17 +171,52 @@ def _extract_pdf(content: bytes, ocr: OcrOptions) -> ExtractedDocument:
         document.close()
 
 
-def _pdf_tables(page: pymupdf.Page) -> str:
+Box = tuple[float, float, float, float]
+
+
+def _with_tables(page: pymupdf.Page, text: str) -> str:
+    """Texte d'une page dont les tableaux sont lus cellule par cellule.
+
+    Les cellules figurent déjà dans le texte natif, sans leur structure : les
+    blocs situés dans un tableau en sont retirés et le tableau structuré prend
+    leur place, à sa position sur la page. Le même contenu n'est ainsi indexé
+    qu'une fois.
+    """
+    tables = _pdf_tables(page)
+    if not tables:
+        return text
+    items: list[tuple[float, float, str]] = [
+        (bbox[1], bbox[0], rows) for bbox, rows in tables
+    ]
+    for block in page.get_text("blocks", sort=True):
+        x0, y0, x1, y1, value, _, block_type = block[:7]
+        value = value.strip()
+        if block_type != 0 or not value:
+            continue
+        center = ((x0 + x1) / 2, (y0 + y1) / 2)
+        if any(_contains(bbox, center) for bbox, _ in tables):
+            continue
+        items.append((y0, x0, value))
+    items.sort(key=lambda item: (item[0], item[1]))
+    return "\n\n".join(value for _, _, value in items)
+
+
+def _contains(bbox: Box, point: tuple[float, float]) -> bool:
+    return bbox[0] <= point[0] <= bbox[2] and bbox[1] <= point[1] <= bbox[3]
+
+
+def _pdf_tables(page: pymupdf.Page) -> list[tuple[Box, str]]:
+    """Tableaux d'une page : emprise et lignes « cellule | cellule »."""
     # La stratégie par défaut (« lines ») ne trouve un tableau que dans les
     # tracés vectoriels : sans tracé, `find_tables` (~45 ms par page) est
     # évité.
     if not page.get_cdrawings():
-        return ""
+        return []
     try:
         found = page.find_tables()
     except Exception:  # noqa: BLE001 — une page sans structure exploitable
-        return ""
-    blocks: list[str] = []
+        return []
+    tables: list[tuple[Box, str]] = []
     for table in found.tables:
         rows = [
             " | ".join((cell or "").replace("\n", " ").strip() for cell in row)
@@ -190,8 +224,8 @@ def _pdf_tables(page: pymupdf.Page) -> str:
         ]
         rows = [row for row in rows if row.strip(" |")]
         if rows:
-            blocks.append("\n".join(rows))
-    return "\n\n".join(blocks)
+            tables.append((tuple(table.bbox), "\n".join(rows)))
+    return tables
 
 
 def _render_page(page: pymupdf.Page, dpi: int) -> np.ndarray:
