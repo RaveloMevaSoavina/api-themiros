@@ -25,12 +25,14 @@ PAGE_SIZE = 256
 
 
 async def reindex(gateway: SupabaseGateway, embedder: Embedder) -> int:
+    """Revectorise par pages jusqu'à ce qu'aucun segment n'ait un autre
+    modèle : chaque page traitée sort de la sélection suivante."""
     done = 0
     while True:
         rows = await gateway.service_select(
             "segment_embeddings",
             params={
-                "select": "segment_id,workspace_id,segments(text)",
+                "select": "segment_id,workspace_id,segments!inner(text)",
                 "model": f"neq.{embedder.model}",
                 "order": "segment_id",
                 "limit": str(PAGE_SIZE),

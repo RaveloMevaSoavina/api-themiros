@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 from app.modules.runs.layer_b import (
@@ -87,6 +88,58 @@ def test_retrieve_keeps_the_closest_extracts_above_the_threshold() -> None:
     assert kept[0].segment_id == segment and kept[0].similarity == 0.7
     assert all(candidate.similarity >= 0.4 for candidate in kept)
     assert len({candidate.segment_id for candidate in kept}) == len(kept)
+
+
+def test_queries_carry_the_expected_evidence() -> None:
+    criterion = _criterion("Efficience", 1)
+    ((_, text),) = _inputs(criterion).queries()
+    assert text == "Efficience : Efficience question 0?\nRapport de suivi"
+    bare = replace(criterion, questions=(SubQuestion(uuid4(), "Q?", None),))
+    assert _inputs(bare).queries()[0][1] == "Efficience : Q?"
+
+
+def test_a_segment_found_by_its_words_is_kept_under_a_lower_threshold() -> None:
+    rules = LayerBRules(min_similarity=0.4, lexical_min_similarity=0.3)
+    question = SubQuestion(uuid4(), "Q?")
+    by_words = replace(_candidate(question, 0.33), lexical_rank=1, score=0.03)
+    by_vector_only = _candidate(question, 0.33)
+    too_far = replace(_candidate(question, 0.2), lexical_rank=2, score=0.02)
+
+    kept = retrieve([by_words, by_vector_only, too_far], rules)[question.id]
+
+    assert [candidate.segment_id for candidate in kept] == [by_words.segment_id]
+
+
+def test_fused_score_orders_the_extracts() -> None:
+    question = SubQuestion(uuid4(), "Q?")
+    close = replace(_candidate(question, 0.7), score=0.016)
+    both = replace(_candidate(question, 0.5), lexical_rank=1, score=0.032)
+
+    kept = retrieve([close, both], RULES)[question.id]
+
+    assert [candidate.segment_id for candidate in kept] == [
+        both.segment_id,
+        close.segment_id,
+    ]
+
+
+def test_one_document_does_not_take_every_place() -> None:
+    rules = LayerBRules(min_similarity=0.4, top_k=4, max_per_document=2)
+    question = SubQuestion(uuid4(), "Q?")
+    report, audit = uuid4(), uuid4()
+    first = [
+        replace(_candidate(question, 0.9 - index / 100), document_id=report)
+        for index in range(4)
+    ]
+    other = replace(_candidate(question, 0.5), document_id=audit)
+
+    kept = retrieve([*first, other], rules)[question.id]
+
+    assert len(kept) == 4
+    assert other in kept
+    # La dernière place revient au document principal faute d'autre source.
+    assert sum(candidate.document_id == report for candidate in kept) == 3
+    assert kept == sorted(kept, key=lambda candidate: -candidate.similarity)
 
 
 def test_a_criterion_under_half_documented_is_not_sent_to_the_ai() -> None:

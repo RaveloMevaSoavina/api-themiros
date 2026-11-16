@@ -32,6 +32,12 @@ class PageText:
     text: str
     char_start: int
     section_title: str | None = None
+    # Titres repérés par leur style (DOCX) : reconnus même quand ils ne
+    # ressemblent pas à un titre (« Contexte du projet »).
+    headings: tuple[str, ...] = ()
+
+    def is_heading(self, line: str) -> bool:
+        return is_heading(line) or line.strip() in self.headings
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +92,7 @@ def _paragraphs(page: PageText) -> Iterable[tuple[str, int, int]]:
     """Paragraphes d'une page avec leur position dans le texte complet."""
     position = 0
     for block in _PARAGRAPH_BREAK.split(page.text):
-        for line_group in _split_lines(block):
+        for line_group in _split_lines(block, page):
             value = line_group.strip()
             if not value:
                 continue
@@ -97,13 +103,13 @@ def _paragraphs(page: PageText) -> Iterable[tuple[str, int, int]]:
             yield value, page.char_start + start, page.char_start + position
 
 
-def _split_lines(block: str) -> list[str]:
+def _split_lines(block: str, page: PageText) -> list[str]:
     """Dans un bloc sans ligne vide (texte PDF), un titre seul sur sa ligne
     ouvre un nouveau paragraphe ; les autres lignes sont recollées."""
     groups: list[str] = []
     current: list[str] = []
     for line in block.split("\n"):
-        if is_heading(line):
+        if page.is_heading(line):
             if current:
                 groups.append("\n".join(current))
                 current = []
@@ -124,7 +130,7 @@ def _units(pages: Iterable[PageText]) -> list[_Unit]:
         # feuille XLSX ou un DOCX apporte le sien.
         section = page.section_title or section
         for text, start, end in _paragraphs(page):
-            heading = is_heading(text)
+            heading = page.is_heading(text)
             if heading:
                 section = text.strip()
             tokens = count_tokens(text)

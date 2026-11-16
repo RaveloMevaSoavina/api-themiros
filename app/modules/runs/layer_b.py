@@ -51,7 +51,7 @@ from app.modules.runs.citations import (
 )
 from app.modules.runs.project import ProjectContext
 
-LAYER_B_VERSION = "layer-b/1.3.0"
+LAYER_B_VERSION = "layer-b/1.4.0"
 PROMPT_CODE = "grade_sub_questions"
 # v1.1 : extraits en phrases, phrases citées, interprétation de chaque
 # extrait cité, sources dans la justification. v1.2 : le projet évalué
@@ -91,6 +91,12 @@ INTERPRETATION_MAX_CHARS = 1500
 class LayerBRules:
     min_similarity: float
     top_k: int = 5
+    # Un segment trouvé aussi par ses mots (recherche plein texte) est retenu
+    # sous un seuil de similarité plus bas : ses termes exacts compensent.
+    lexical_min_similarity: float | None = None
+    # Extraits d'un même document par sous-question, tant que d'autres
+    # documents en proposent : la convergence entre documents se lit mieux.
+    max_per_document: int | None = 3
     excerpts_per_question: int = 3
     excerpt_chars: int = 600
     max_input_tokens: int = 30000
@@ -152,10 +158,21 @@ class LayerBInputs:
         )
 
     def queries(self) -> list[tuple[UUID, str]]:
-        """Texte vectorisé de chaque sous-question : le nom du critère situe
-        la question, comme les sondes des piliers (« pilier : variable »)."""
+        """Texte recherché pour chaque sous-question : le nom du critère situe
+        la question, comme les sondes des piliers (« pilier : variable »), et
+        les preuves attendues disent ce qu'on cherche dans les documents."""
         return [
-            (question.id, f"{criterion.name} : {question.text}")
+            (
+                question.id,
+                "\n".join(
+                    part
+                    for part in (
+                        f"{criterion.name} : {question.text}",
+                        (question.expected_evidence or "").strip(),
+                    )
+                    if part
+                ),
+            )
             for criterion in self.criteria
             for question in criterion.questions
         ]
@@ -170,6 +187,10 @@ class Candidate:
     document_id: UUID
     similarity: float
     text: str
+    # Rang dans la recherche plein texte (None : trouvé par les vecteurs
+    # seuls) et score de la fusion des deux classements.
+    lexical_rank: int | None = None
+    score: float | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "Candidate":
@@ -179,6 +200,25 @@ class Candidate:
             UUID(row["document_id"]),
             float(row["similarity"]),
             row.get("text") or "",
+            int(row["lexical_rank"]) if row.get("lexical_rank") is not None else None,
+            float(row["score"]) if row.get("score") is not None else None,
+        )
+
+    def is_relevant(self, rules: "LayerBRules") -> bool:
+        if self.similarity >= rules.min_similarity:
+            return True
+        return (
+            self.lexical_rank is not None
+            and rules.lexical_min_similarity is not None
+            and self.similarity >= rules.lexical_min_similarity
+        )
+
+    def rank_key(self) -> tuple[float, float, str]:
+        """Score fusionné d'abord (similarité seule sans recherche hybride)."""
+        return (
+            -(self.score if self.score is not None else self.similarity),
+            -self.similarity,
+            str(self.segment_id),
         )
 
 
@@ -357,23 +397,43 @@ class LayerBResults:
 def retrieve(
     candidates: Iterable[Candidate], rules: LayerBRules
 ) -> dict[UUID, list[Candidate]]:
-    """Extraits retenus par sous-question : au-dessus du seuil, les plus
-    proches d'abord, un segment une seule fois."""
+    """Extraits retenus par sous-question : au-dessus du seuil, les mieux
+    classés d'abord, un segment une seule fois, au plus `max_per_document`
+    d'un même document tant que d'autres documents en proposent."""
     by_question: dict[UUID, dict[UUID, Candidate]] = defaultdict(dict)
     for candidate in candidates:
-        if candidate.similarity < rules.min_similarity:
+        if not candidate.is_relevant(rules):
             continue
         kept = by_question[candidate.sub_question_id]
         current = kept.get(candidate.segment_id)
-        if current is None or candidate.similarity > current.similarity:
+        if current is None or candidate.rank_key() < current.rank_key():
             kept[candidate.segment_id] = candidate
     return {
-        question_id: sorted(
-            kept.values(),
-            key=lambda candidate: (-candidate.similarity, str(candidate.segment_id)),
-        )[: rules.top_k]
+        question_id: _diversified(sorted(kept.values(), key=Candidate.rank_key), rules)
         for question_id, kept in by_question.items()
     }
+
+
+def _diversified(ranked: list[Candidate], rules: LayerBRules) -> list[Candidate]:
+    """Les `top_k` premiers, sans qu'un document en occupe plus de
+    `max_per_document` ; si les autres documents n'en proposent pas assez,
+    les places restantes reviennent aux suivants, dans l'ordre."""
+    limit = rules.max_per_document
+    if limit is None:
+        return ranked[: rules.top_k]
+    chosen: list[Candidate] = []
+    deferred: list[Candidate] = []
+    per_document: dict[UUID, int] = defaultdict(int)
+    for candidate in ranked:
+        if per_document[candidate.document_id] < limit:
+            per_document[candidate.document_id] += 1
+            chosen.append(candidate)
+        else:
+            deferred.append(candidate)
+        if len(chosen) == rules.top_k:
+            return chosen
+    chosen.extend(deferred[: rules.top_k - len(chosen)])
+    return sorted(chosen, key=Candidate.rank_key)
 
 
 def is_documented_enough(documented: int, total: int, ratio: float) -> bool:

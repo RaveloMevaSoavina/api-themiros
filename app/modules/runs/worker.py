@@ -170,6 +170,8 @@ class RunWorker:
     def layer_b_rules(self) -> LayerBRules:
         return LayerBRules(
             min_similarity=self._settings.run_layer_b_min_similarity,
+            lexical_min_similarity=(self._settings.run_layer_b_lexical_min_similarity),
+            max_per_document=self._settings.run_layer_b_max_per_document,
             top_k=self._settings.run_layer_b_top_k,
             excerpts_per_question=self._settings.run_layer_b_excerpts_per_question,
             excerpt_chars=self._settings.run_layer_b_excerpt_chars,
@@ -359,8 +361,10 @@ class RunWorker:
                 run,
                 self._embedder.model,
                 [
-                    (question_id, vector)
-                    for (question_id, _), vector in zip(queries, vectors, strict=True)
+                    (question_id, text, vector)
+                    for (question_id, text), vector in zip(
+                        queries, vectors, strict=True
+                    )
                 ],
                 rules.top_k,
             )

@@ -73,11 +73,12 @@ class RunRepository:
         self,
         run: ClaimedRun,
         model: str,
-        queries: list[tuple[UUID, list[float]]],
+        queries: list[tuple[UUID, str, list[float]]],
         top_k: int,
     ) -> list[Candidate]:
-        """Recherche exacte : son coût croît avec le nombre de sous-questions,
-        d'où des lots qui tiennent chacun sous le statement_timeout."""
+        """Recherche hybride (vecteurs et plein texte) : son coût croît avec
+        le nombre de sous-questions, d'où des lots qui tiennent chacun sous le
+        statement_timeout."""
         size = self._settings.run_layer_b_match_batch_size
         candidates: list[Candidate] = []
         for start in range(0, len(queries), size):
@@ -89,9 +90,10 @@ class RunRepository:
                     "p_queries": [
                         {
                             "sub_question_id": str(question_id),
+                            "text": text,
                             "embedding": vector_literal(vector),
                         }
-                        for question_id, vector in queries[start : start + size]
+                        for question_id, text, vector in queries[start : start + size]
                     ],
                     "p_top_k": top_k,
                 },

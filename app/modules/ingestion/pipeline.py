@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 from app.core.config import Settings
 from app.core.errors import ApiError
+from app.modules.ingestion.analysis.cleaning import clean_pages
 from app.modules.ingestion.analysis.country import CountryDetector
 from app.modules.ingestion.analysis.embeddings import (
     Embedder,
@@ -59,6 +60,16 @@ StageCallback = Callable[[str], Awaitable[None]]
 # ~10 Ko par segment (texte + vecteur 768) : ~1,3 Mo par appel.
 SEGMENT_BATCH_SIZE = 128
 OCR_LANGUAGES = {"fr": "fra", "en": "eng", "pt": "por", "es": "spa"}
+
+# Page dont l'OCR est peu sûr (confiance moyenne des mots) : signalée dans le
+# journal d'extraction.
+OCR_LOW_CONFIDENCE = 0.6
+
+
+def segment_document(pages: Sequence[PageText]) -> list[Segment]:
+    """Segments d'un document, débarrassés des en-têtes, pieds de page et
+    césures ; le texte des pages conservé en base reste intact (RG-4.6)."""
+    return segment_pages(clean_pages(pages))
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +187,7 @@ class IngestionPipeline:
                         "humaine sont indexés"
                     ),
                 )
-            segments = await asyncio.to_thread(segment_pages, stored.pages)
+            segments = await asyncio.to_thread(segment_document, stored.pages)
             outcome = await self.index(
                 job,
                 segments,
@@ -223,8 +234,15 @@ class IngestionPipeline:
                 "ocr_failed": page.ocr_failed,
                 "is_exploitable": page.is_exploitable(min_chars),
                 "char_start": page.char_start,
+                "headings": list(page.headings),
+                "ocr_confidence": page.ocr_confidence,
             }
             for page in extracted.pages
+        ]
+        confidences = [
+            page.ocr_confidence
+            for page in extracted.pages
+            if page.ocr_confidence is not None
         ]
         exploitable = extracted.exploitable_pages(min_chars)
         await self._repository.commit_extraction(
@@ -236,6 +254,14 @@ class IngestionPipeline:
                 "tokens": await asyncio.to_thread(count_tokens, extracted.text),
                 "ocr_pages": sum(page.is_ocr for page in extracted.pages),
                 "ocr_failed_pages": sum(page.ocr_failed for page in extracted.pages),
+                "ocr_confidence": (
+                    round(sum(confidences) / len(confidences), 3)
+                    if confidences
+                    else None
+                ),
+                "ocr_low_confidence_pages": sum(
+                    value < OCR_LOW_CONFIDENCE for value in confidences
+                ),
             },
         )
         # Arbitrage n° 8 : aucun contenu exploitable = échec d'extraction,
@@ -246,7 +272,11 @@ class IngestionPipeline:
         stored = StoredPages(
             pages=[
                 PageText(
-                    page.page_number, page.text, page.char_start, page.section_title
+                    page.page_number,
+                    page.text,
+                    page.char_start,
+                    page.section_title,
+                    page.headings,
                 )
                 for page in extracted.pages
             ],
@@ -289,7 +319,7 @@ class IngestionPipeline:
         )
 
         await on_stage("pertinence")
-        segments = await asyncio.to_thread(segment_pages, stored.pages)
+        segments = await asyncio.to_thread(segment_document, stored.pages)
         if not segments:
             raise no_exploitable_content()
         fingerprint = await self._fingerprint(profile)

@@ -283,7 +283,9 @@ class IngestionRepository:
             "document_pages",
             params={
                 "document_id": f"eq.{document_id}",
-                "select": "page_number,text,section_title,char_start,is_exploitable",
+                "select": (
+                    "page_number,text,section_title,char_start,is_exploitable,headings"
+                ),
                 "order": "page_number.asc",
             },
         )
@@ -300,6 +302,7 @@ class IngestionRepository:
                     text=row.get("text") or "",
                     char_start=row.get("char_start") or 0,
                     section_title=row.get("section_title"),
+                    headings=tuple(row.get("headings") or ()),
                 )
                 for row in rows
             ],

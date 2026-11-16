@@ -1,0 +1,28 @@
+{
+  "name": "Projet X — revue à mi-parcours 2025",
+  "documents": [
+    "00000000-0000-0000-0000-000000000001",
+    "00000000-0000-0000-0000-000000000002"
+  ],
+  "questions": [
+    {
+      "id": "GOUV-1",
+      "criterion": "Efficacité",
+      "text": "Le projet dispose-t-il d'une instance de pilotage qui se réunit et prend des décisions ?",
+      "expected_evidence": "Comptes rendus du comité de pilotage, décisions prises",
+      "relevant": [
+        {
+          "document": "00000000-0000-0000-0000-000000000001",
+          "quote": "Le comité de pilotage s'est réuni à quatre reprises"
+        }
+      ]
+    },
+    {
+      "id": "DUR-3",
+      "criterion": "Durabilité",
+      "text": "Une stratégie de sortie est-elle formalisée ?",
+      "expected_evidence": "Plan de sortie, transfert aux partenaires",
+      "relevant": []
+    }
+  ]
+}

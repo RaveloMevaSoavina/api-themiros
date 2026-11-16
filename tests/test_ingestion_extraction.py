@@ -12,6 +12,7 @@ from app.modules.ingestion.extraction import (
     detect_format,
     detect_pdf_type,
     extract_document,
+    ocr_result,
 )
 
 PARAGRAPH = (
@@ -129,6 +130,59 @@ def test_scanned_pdf_goes_through_ocr() -> None:
     assert page.is_ocr
     assert not page.ocr_failed
     assert "irrigation" in page.text.lower()
+    assert page.ocr_confidence is not None and 0.5 < page.ocr_confidence <= 1
+
+
+def test_ocr_text_follows_tesseract_lines_and_weights_confidence() -> None:
+    data = {
+        "text": ["", "Comite", "de", "pilotage", "Budget", " "],
+        "block_num": [1, 1, 1, 1, 2, 2],
+        "par_num": [1, 1, 1, 1, 1, 1],
+        "line_num": [1, 1, 1, 2, 1, 1],
+        "conf": [-1, 90, 90, 60, 80, -1],
+    }
+    result = ocr_result(data)
+    assert result.text == "Comite de\npilotage\n\nBudget"
+    # (6×90 + 2×90 + 8×60 + 6×80) / 22 lettres.
+    assert result.confidence == 0.764
+    assert ocr_result({"text": []}).confidence is None
+
+
+def _two_column_pdf() -> bytes:
+    left = "Colonne gauche. " + (
+        "Le projet finance des forages et des retenues collinaires. " * 6
+    )
+    right = "Colonne droite. " + (
+        "Les comites de gestion de l'eau se reunissent chaque mois. " * 6
+    )
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_textbox(
+        pymupdf.Rect(50, 40, 550, 70), "RAPPORT ANNUEL DU PROJET", fontsize=14
+    )
+    page.insert_textbox(pymupdf.Rect(50, 90, 290, 500), left, fontsize=10)
+    page.insert_textbox(pymupdf.Rect(310, 90, 550, 500), right, fontsize=10)
+    return document.tobytes()
+
+
+def test_two_column_pdf_page_is_read_column_by_column() -> None:
+    text = extract_document(_two_column_pdf(), "rapport.pdf").pages[0].text
+    # Toute la colonne gauche avant la colonne droite, le titre en tête.
+    assert text.index("RAPPORT ANNUEL") < text.index("Colonne gauche")
+    assert text.rindex("retenues collinaires") < text.index("Colonne droite")
+
+
+def test_aligned_labels_and_values_are_not_read_as_columns() -> None:
+    document = pymupdf.open()
+    page = document.new_page()
+    for index in range(8):
+        page.insert_text((50, 80 + index * 20), f"Libelle {index} :", fontsize=10)
+        page.insert_text(
+            (320, 80 + index * 20), f"Valeur numero {index} du projet", fontsize=10
+        )
+    lines = extract_document(document.tobytes(), "fiche.pdf").pages[0].text
+    first = lines.split("\n")[0]
+    assert "Libelle 0" in first and "Valeur numero 0" in first
 
 
 def test_password_protected_pdf_is_rejected_explicitly() -> None:
@@ -164,9 +218,23 @@ def test_docx_keeps_headings_lists_and_tables_in_order() -> None:
     text = extracted.pages[0].text
     assert extracted.format == "docx"
     assert extracted.pages[0].section_title == "1. Contexte"
+    assert extracted.pages[0].headings == ("1. Contexte",)
     assert text.index("1. Contexte") < text.index("irrigation")
     assert "- Renforcer les capacités" in text
     assert "Irrigation | 120 000" in text
+
+
+def test_docx_headings_are_kept_whatever_their_wording() -> None:
+    document = Document()
+    document.add_heading("Contexte du projet", level=1)
+    document.add_paragraph(PARAGRAPH)
+    document.add_heading("Dispositif de suivi", level=2)
+    document.add_paragraph(PARAGRAPH)
+    buffer = BytesIO()
+    document.save(buffer)
+
+    page = extract_document(buffer.getvalue(), "prodoc.docx").pages[0]
+    assert page.headings == ("Contexte du projet", "Dispositif de suivi")
 
 
 def test_xlsx_gives_one_page_per_sheet_with_cell_positions() -> None:
@@ -177,6 +245,7 @@ def test_xlsx_gives_one_page_per_sheet_with_cell_positions() -> None:
     budget["B1"] = "Montant"
     budget["A2"] = "Irrigation"
     budget["B2"] = 120000
+    budget["C2"] = "à confirmer"
     indicators = workbook.create_sheet("Indicateurs")
     indicators["A1"] = "Ménages"
     buffer = BytesIO()
@@ -185,4 +254,9 @@ def test_xlsx_gives_one_page_per_sheet_with_cell_positions() -> None:
     extracted = extract_document(buffer.getvalue(), "budget.xlsx")
     assert extracted.format == "xlsx"
     assert [page.section_title for page in extracted.pages] == ["Budget", "Indicateurs"]
-    assert "A2=Irrigation | B2=120000" in extracted.pages[0].text
+    lines = extracted.pages[0].text.split("\n")
+    assert lines[0] == "A1=Activité | B1=Montant"
+    # Chaque valeur porte son en-tête ; une colonne sans en-tête garde sa
+    # seule coordonnée.
+    assert lines[1] == "A2 Activité : Irrigation | B2 Montant : 120000 | C2=à confirmer"
+    assert extracted.pages[1].text == "A1=Ménages"

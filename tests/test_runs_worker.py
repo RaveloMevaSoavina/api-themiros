@@ -126,7 +126,10 @@ class FakeRepository:
         return self.layer_b_value
 
     async def sub_question_matches(self, run, model, queries, top_k):
-        self.queries.append((model, [question_id for question_id, _ in queries], top_k))
+        self.queries.append(
+            (model, [question_id for question_id, _, _ in queries], top_k)
+        )
+        self.query_texts = [text for _, text, _ in queries]
         return self.matches
 
     async def prompt(self, code, version):
@@ -165,7 +168,7 @@ async def test_empty_queue_does_nothing() -> None:
     assert repository.claims == [
         (
             "host-1#runs",
-            "layer-a/1.0.0+layer-b/1.3.0+layer-c/1.2.0+reading/1.0.0+restitution/1.6.0",
+            "layer-a/1.0.0+layer-b/1.4.0+layer-c/1.2.0+reading/1.0.0+restitution/1.6.0",
         )
     ]
 
@@ -337,6 +340,8 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     await _layer_b_worker(repository, grader).run_once()
 
     assert grader.calls == 1
+    # La recherche reçoit aussi le texte de chaque sous-question (plein texte).
+    assert repository.query_texts and all(repository.query_texts)
     # Le projet évalué accompagne le message : les textes parlent de lui.
     assert grader.batches[0].content["pj"] == {"n": "Résilience Sahel", "t": "project"}
     steps = [(name, status) for name, status, _ in repository.steps]

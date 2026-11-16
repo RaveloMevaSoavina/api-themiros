@@ -111,6 +111,11 @@ class Settings(BaseSettings):
     # tiennent toujours en un seul appel.
     run_layer_b_min_similarity: float = Field(default=0.32, gt=0, le=1)
     run_layer_b_top_k: int = Field(default=8, ge=1, le=20)
+    # Recherche hybride : un segment trouvé aussi par ses mots est retenu dès
+    # cette similarité ; au plus N extraits d'un même document par
+    # sous-question tant que d'autres documents en proposent.
+    run_layer_b_lexical_min_similarity: float = Field(default=0.25, gt=0, le=1)
+    run_layer_b_max_per_document: int = Field(default=3, ge=1, le=20)
     # Sous-questions par appel de recherche : la base coupe une requête
     # au-delà de 8 s.
     run_layer_b_match_batch_size: int = Field(default=8, ge=1, le=100)

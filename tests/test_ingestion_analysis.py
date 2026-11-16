@@ -154,6 +154,26 @@ def test_heading_without_content_opens_the_next_section_segment() -> None:
     assert segments[0].char_start == 0
 
 
+def test_styled_headings_open_sections_even_without_heading_shape() -> None:
+    text = "\n\n".join(
+        [
+            "Contexte du projet",
+            "Le contexte national. " * 40,
+            "Dispositif de suivi",
+            "Les indicateurs suivis. " * 40,
+        ]
+    )
+    page = PageText(
+        1,
+        text,
+        0,
+        section_title="Contexte du projet",
+        headings=("Contexte du projet", "Dispositif de suivi"),
+    )
+    sections = [segment.section_title for segment in segment_pages([page])]
+    assert sections == ["Contexte du projet", "Dispositif de suivi"]
+
+
 def test_very_long_paragraph_is_split_by_sentence() -> None:
     long_paragraph = "Une phrase sur le suivi des indicateurs du programme. " * 400
     segments = segment_pages([PageText(1, long_paragraph, 0)])
