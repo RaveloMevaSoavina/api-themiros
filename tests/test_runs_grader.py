@@ -11,12 +11,16 @@ from app.modules.runs.domain import LayerAResults
 from app.modules.runs.grader import (
     GradingUnavailable,
     LlmAlert,
+    LlmAlertMessage,
+    LlmAlertTranslation,
     LlmCriterionJustification,
     LlmGrade,
     LlmGradingOutput,
+    LlmGradingTranslation,
     LlmProjection,
     LlmQualificationOutput,
-    LlmReading,
+    LlmReadingOutput,
+    LlmReadingTranslation,
     LlmRestitutionAction,
     LlmRestitutionItem,
     LlmRestitutionOutput,
@@ -24,9 +28,11 @@ from app.modules.runs.grader import (
     LlmTranslatedAction,
     LlmTranslatedItem,
     OpenAIAlertQualifier,
+    OpenAIEvidenceReader,
     OpenAIRestitutionWriter,
     OpenAISubQuestionGrader,
     build_alert_qualifier,
+    build_evidence_reader,
     build_restitution_writer,
     build_sub_question_grader,
 )
@@ -48,6 +54,7 @@ from app.modules.runs.layer_c import (
     RawQualification,
 )
 from app.modules.runs.layer_c import build_batches as build_alert_batches
+from app.modules.runs.reading import ReadingBatch
 from app.modules.runs.restitution import (
     RawProjection,
     RestitutionRules,
@@ -119,10 +126,17 @@ OUTPUT = LlmGradingOutput(
             n=2,
             e=["E1.1"],
             c=False,
-            i=[LlmReading(e="E1", t="Le projet répond aux priorités.")],
+            t="Le projet répond aux priorités.",
         )
     ],
     c=[LlmCriterionJustification(k="C1", j="Besoins analysés.")],
+    tr=[
+        LlmGradingTranslation(
+            l="en",
+            q=[LlmTranslatedItem(k="Q1", t="The project meets the priorities.")],
+            c=[LlmCriterionJustification(k="C1", j="Needs analysed.")],
+        )
+    ],
 )
 
 
@@ -141,8 +155,11 @@ async def test_one_structured_call_returns_the_ratings_and_their_cost() -> None:
     assert request["input"][1]["content"] == batch.message()
     assert raw.grades[0].key == "Q1" and raw.grades[0].note == 2
     assert raw.grades[0].excerpts == ("E1.1",)
-    assert raw.grades[0].readings == {"E1": "Le projet répond aux priorités."}
+    assert raw.grades[0].interpretation == "Le projet répond aux priorités."
     assert raw.justifications == {"C1": "Besoins analysés."}
+    translation = raw.translations["en"]
+    assert translation.interpretations == {"Q1": "The project meets the priorities."}
+    assert translation.justifications == {"C1": "Needs analysed."}
     assert usage.cost_eur == Decimal("0.004800")
 
 
@@ -219,7 +236,12 @@ def _qualification_batch():
 
 async def test_one_structured_call_qualifies_the_gaps() -> None:
     output = LlmQualificationOutput(
-        a=[LlmAlert(k="A1", ok=True, g="mineure", m="Écart explicable.", e=["E1"])]
+        a=[LlmAlert(k="A1", ok=True, g="mineure", m="Écart explicable.", e=["E1"])],
+        tr=[
+            LlmAlertTranslation(
+                l="en", a=[LlmAlertMessage(k="A1", m="Explainable gap.")]
+            )
+        ],
     )
     client = FakeOpenAI(output=output)
     batch = _qualification_batch()
@@ -233,7 +255,14 @@ async def test_one_structured_call_qualifies_the_gaps() -> None:
     assert "temperature" not in request
     assert request["input"][1]["content"] == batch.message()
     assert raw == [
-        RawQualification("A1", True, "mineure", "Écart explicable.", ("E1",))
+        RawQualification(
+            "A1",
+            True,
+            "mineure",
+            "Écart explicable.",
+            ("E1",),
+            {"en": "Explainable gap."},
+        )
     ]
     assert usage.cost_eur == Decimal("0.004800")
 
@@ -270,10 +299,8 @@ async def test_one_structured_call_writes_the_restitution() -> None:
                 i=[LlmTranslatedItem(k="V1", t="Gap to verify.")],
                 c="Results suggest a gap.",
                 a=[LlmTranslatedAction(k="V1", dec=english, pmu=english, ana=english)],
-                x=[LlmTranslatedItem(k="E1", t="The extract states a gap.")],
             )
         ],
-        x=[LlmTranslatedItem(k="E1", t="L'extrait établit un écart.")],
     )
     client = FakeOpenAI(output=output)
     prompt = {**PROMPT, "parameters": {"max_tokens": 3000}}
@@ -297,10 +324,8 @@ async def test_one_structured_call_writes_the_restitution() -> None:
     assert action.projections["analyste"] == RawProjection(
         "Vérifier l'écart.", "l'écart est majeur"
     )
-    assert raw.readings == {"E1": "L'extrait établit un écart."}
     translation = raw.translations["en"]
     assert translation.items == {"V1": "Gap to verify."}
-    assert translation.readings == {"E1": "The extract states a gap."}
     assert translation.conclusion == "Results suggest a gap."
     assert translation.actions["V1"]["pmu"] == RawProjection(
         "Check the gap.", "the gap is major"
@@ -310,3 +335,40 @@ async def test_one_structured_call_writes_the_restitution() -> None:
 def test_no_restitution_writer_when_ai_is_disabled() -> None:
     assert build_restitution_writer(Settings(ai_provider="disabled")) is None
     assert build_restitution_writer(_settings()) is not None
+
+
+async def test_one_structured_call_reads_extracts_variables_and_pillars() -> None:
+    output = LlmReadingOutput(
+        s=[LlmTranslatedItem(k="E1", t="Le projet a un comité [E1.1].")],
+        v=[LlmTranslatedItem(k="V1", t="Le projet se pilote [E1].")],
+        p=[LlmTranslatedItem(k="P1", t="La gouvernance du projet [E1].")],
+        tr=[
+            LlmReadingTranslation(
+                l="en",
+                s=[LlmTranslatedItem(k="E1", t="The project has a board [E1.1].")],
+                v=[],
+                p=[LlmTranslatedItem(k="P1", t="Project governance [E1].")],
+            )
+        ],
+    )
+    client = FakeOpenAI(output=output)
+    batch = ReadingBatch(content={"lang": "fr"}, max_output_tokens=9000)
+    prompt = {**PROMPT, "parameters": {"max_tokens": 4000}}
+
+    raw, _ = await OpenAIEvidenceReader(_settings(), client).read(prompt, batch)
+
+    request = client.responses.last_request
+    assert request["text_format"] is LlmReadingOutput
+    assert request["max_output_tokens"] == 9500
+    assert raw.segments == {"E1": "Le projet a un comité [E1.1]."}
+    assert raw.variables == {"V1": "Le projet se pilote [E1]."}
+    assert raw.pillars == {"P1": "La gouvernance du projet [E1]."}
+    translation = raw.translations["en"]
+    assert translation.segments == {"E1": "The project has a board [E1.1]."}
+    assert translation.variables == {}
+    assert translation.pillars == {"P1": "Project governance [E1]."}
+
+
+def test_no_evidence_reader_when_ai_is_disabled() -> None:
+    assert build_evidence_reader(Settings(ai_provider="disabled")) is None
+    assert build_evidence_reader(_settings()) is not None

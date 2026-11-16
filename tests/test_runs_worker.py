@@ -23,6 +23,7 @@ from app.modules.runs.layer_b import (
 )
 from app.modules.runs.layer_c import LayerCInputs, PillarCriterion, RawQualification
 from app.modules.runs.project import ProjectContext
+from app.modules.runs.reading import RawReading, RawReadingTranslation, VariableLabel
 from app.modules.runs.repository import ClaimedRun
 from app.modules.runs.restitution import (
     RawAction,
@@ -36,6 +37,16 @@ from app.modules.usage.ledger import UsageLedger, count_embedding
 VERSION = UUID("55555555-5555-4555-8555-555555555555")
 VARIABLE = UUID("33333333-3333-4333-8333-333333333333")
 DOCUMENTS = [uuid4(), uuid4()]
+# Suite d'analyse : chaque texte de l'IA est un paragraphe (plus court, il
+# n'est pas publié).
+PAD = (
+    " Les documents du projet décrivent ce point en détail, sans préciser "
+    "encore comment il se traduit dans sa mise en œuvre effective."
+)
+EN_PAD = (
+    " The project documents describe this point in great detail, without "
+    "yet stating how it translates into its actual day-to-day implementation."
+)
 
 
 def _run(min_sources: int = 2) -> ClaimedRun:
@@ -90,9 +101,17 @@ class FakeRepository:
         self.text_requests: list[list[UUID]] = []
         self.texts: dict[UUID, str] = {}
         self.project_value = ProjectContext(name="Résilience Sahel", kind="project")
+        self.labels = {
+            (inputs.pillars[0].id, "has_budget_execution"): VariableLabel(
+                "Exécution budgétaire", "Le budget est exécuté."
+            )
+        }
 
     async def project(self, run):
         return self.project_value
+
+    async def variable_labels(self, run):
+        return self.labels
 
     async def layer_c_inputs(self, run):
         return self.layer_c_value
@@ -144,7 +163,10 @@ async def test_empty_queue_does_nothing() -> None:
     repository = FakeRepository([], _inputs())
     assert await _worker(repository).run_once() is False
     assert repository.claims == [
-        ("host-1#runs", "layer-a/1.0.0+layer-b/1.2.0+layer-c/1.1.0+restitution/1.5.0")
+        (
+            "host-1#runs",
+            "layer-a/1.0.0+layer-b/1.3.0+layer-c/1.2.0+reading/1.0.0+restitution/1.6.0",
+        )
     ]
 
 
@@ -267,6 +289,7 @@ class FakeGrader:
         self.batches.append(batch)
         if self.error:
             raise self.error
+        first = sorted(next(iter(batch.allowed.values())))[0]
         return (
             RawGrading(
                 grades=tuple(
@@ -275,10 +298,13 @@ class FakeGrader:
                         self.note,
                         tuple(sorted(batch.allowed[question_id])),
                         False,
+                        f"Le projet répond à la question [{first}]." + PAD,
                     )
                     for key, question_id in batch.question_keys.items()
                 ),
-                justifications={"C1": "Alignement net avec les priorités."},
+                justifications={
+                    "C1": f"Le projet s'aligne sur les priorités [{first}]." + PAD * 2
+                },
             ),
             AiUsage("test-llm", 1200, 80, Decimal("0.0021")),
         )
@@ -320,11 +346,15 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     (results,) = repository.completed
     (note,) = results["layer_b"]["notes"]
     assert note["status"] == "conclu" and note["note"] == 3.0
-    assert note["justification"] == "Alignement net avec les priorités."
+    assert note["justification"].startswith("Le projet s'aligne sur les priorités⟦1⟧.")
+    assert len(note["citations"]) == 1
+    answer = results["layer_b"]["answers"][0]
+    assert answer["interpretation"].startswith("Le projet répond à la question⟦1⟧.")
+    assert len(answer["interpretation_citations"]) == 1
     assert len(results["layer_b"]["evidences"]) == 2
     ai = results["rules"]["layer_b"]["ai"]
     assert ai["status"] == "completed" and ai["calls"] == 1
-    assert ai["prompt"] == "grade_sub_questions_v1.2"
+    assert ai["prompt"] == "grade_sub_questions_v1.3"
     assert (ai["input_tokens"], ai["output_tokens"]) == (1200, 80)
     summary = next(
         s for n, st, s in repository.steps if (n, st) == ("layer_b", "completed")
@@ -429,8 +459,9 @@ class FakeQualifier:
                     key,
                     self.confirmed,
                     "majeure",
-                    "Budget bien documenté, pertinence faiblement étayée.",
-                    tuple(batch.allowed[alert_id])[:1],
+                    "Le projet documente son budget "
+                    f"[{sorted(batch.allowed[alert_id])[0]}]." + PAD,
+                    tuple(sorted(batch.allowed[alert_id]))[:1],
                 )
                 for key, alert_id in batch.alert_keys.items()
             ],
@@ -472,19 +503,20 @@ async def test_layer_c_qualifies_every_gap_in_a_single_ai_call() -> None:
     assert qualifier.batches[0].content["pj"]["n"] == "Résilience Sahel"
     # Les extraits de la couche B sont déjà lus ; seuls ceux de la couche A
     # sont demandés.
-    (requested,) = repository.text_requests
+    requested = repository.text_requests[0]
     b_segments = {candidate.segment_id for candidate in repository.matches}
     assert requested and not set(requested) & b_segments
     (results,) = repository.completed
     (alert,) = results["layer_c"]["alerts"]
     assert alert["rule_code"] == "ALERT-01" and alert["severity"] == "majeure"
     assert alert["qualified"] is True
-    assert alert["message"] == "Budget bien documenté, pertinence faiblement étayée."
+    assert alert["message"].startswith("Le projet documente son budget⟦1⟧.")
+    assert len(alert["citations"]) == 1
     assert len(alert["segment_ids"]) == 1
     ai = results["rules"]["layer_c"]["ai"]
     assert ai["status"] == "completed" and ai["calls"] == 1
-    assert ai["prompt"] == "detect_incoherence_v1.1"
-    assert results["rules"]["layer_c"]["engine_version"] == "layer-c/1.1.0"
+    assert ai["prompt"] == "detect_incoherence_v1.2"
+    assert results["rules"]["layer_c"]["engine_version"] == "layer-c/1.2.0"
     summary = next(
         s for n, st, s in repository.steps if (n, st) == ("layer_c", "completed")
     )
@@ -564,13 +596,19 @@ class FakeWriter:
         if self.error:
             raise self.error
         projections = {
-            persona: RawProjection(f"Action ({persona}).", "le critère est faible")
+            persona: RawProjection(
+                f"Action ({persona}).", "le critère est faible" + PAD
+            )
             for persona in ("decideur", "pmu", "analyste")
         }
         return (
             RawRestitution(
                 items=tuple(
-                    RawItem(key, f"Constat {key}.", tuple(batch.allowed[key])[:1])
+                    RawItem(
+                        key,
+                        f"Le projet présente le constat {key}." + PAD,
+                        tuple(batch.allowed[key])[:1],
+                    )
                     for key, finding in batch.findings.items()
                     if finding.section is not None
                 ),
@@ -611,7 +649,7 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
         "faiblesse",
         "a_verifier",
     ]
-    assert restitution["items"][0]["text"] == "Constat W1."
+    assert restitution["items"][0]["text"] == "Le projet présente le constat W1." + PAD
     assert restitution["synthesis"]["qualified"] is True
     assert restitution["synthesis"]["status"] == "completed"
     assert restitution["synthesis"]["conclusion"].startswith("Les résultats")
@@ -621,9 +659,9 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     ]
     assert all(len(action["projections"]) == 3 for action in restitution["actions"])
     rules = results["rules"]["restitution"]
-    assert rules["engine_version"] == "restitution/1.5.0"
+    assert rules["engine_version"] == "restitution/1.6.0"
     assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
-    assert rules["ai"]["prompt"] == "formulate_restitution_v1.4"
+    assert rules["ai"]["prompt"] == "formulate_restitution_v1.5"
     assert results["summary"]["actions"] == 2
     assert repository.failures == []
 
@@ -646,7 +684,9 @@ async def test_without_ai_the_synthesis_keeps_factual_labels() -> None:
         "citations": [],
     }
     assert restitution["actions"] == []
-    assert restitution["readings"] == []
+    # Sans IA, les preuves restent sans lecture.
+    assert results["readings"] == []
+    assert results["rules"]["reading"]["ai"]["errors"] == ["AI_DISABLED"]
     ai = results["rules"]["restitution"]["ai"]
     assert ai["status"] == "unavailable" and ai["errors"] == ["AI_DISABLED"]
 
@@ -691,3 +731,119 @@ async def test_a_missing_project_context_does_not_fail_the_run() -> None:
 
     assert "pj" not in grader.batches[0].content
     assert len(repository.completed) == 1 and repository.failures == []
+
+
+class FakeReader:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.batches: list = []
+
+    async def read(self, prompt, batch):
+        self.batches.append(batch)
+        if self.error:
+            raise self.error
+
+        def cited(key: str) -> str:
+            return sorted(batch.allowed[key])[0]
+
+        return (
+            RawReading(
+                segments={
+                    key: f"Le projet exécute son budget [{key}.1]." + PAD
+                    for key in batch.to_read
+                },
+                variables={
+                    key: f"Le projet suit son exécution [{cited(key)}]." + PAD
+                    for key in batch.variable_keys
+                },
+                pillars={
+                    key: f"Le projet gère ses finances [{cited(key)}]." + PAD * 2
+                    for key in batch.pillar_keys
+                },
+                translations={
+                    "en": RawReadingTranslation(
+                        segments={
+                            key: f"The project spends its budget [{key}.1]." + EN_PAD
+                            for key in batch.to_read
+                        }
+                    )
+                },
+            ),
+            AiUsage("test-llm", 1800, 900, Decimal("0.0040")),
+        )
+
+
+def _reading_worker(repository, reader, gateway=None) -> RunWorker:
+    return RunWorker(
+        repository,
+        Settings(),
+        worker_id="host-1",
+        embedder=FakeEmbedder(),
+        grader=FakeGrader(note=1),
+        qualifier=FakeQualifier(),
+        writer=FakeWriter(),
+        reader=reader,
+        ledger=UsageLedger(gateway, Settings()) if gateway else None,
+    )
+
+
+async def test_every_segment_variable_and_pillar_is_read_in_a_single_ai_call() -> None:
+    repository = _layer_c_repository()
+    reader = FakeReader()
+    gateway = FakeUsageGateway()
+
+    await _reading_worker(repository, reader, gateway).run_once()
+
+    (batch,) = reader.batches
+    content = batch.content
+    assert content["pj"]["n"] == "Résilience Sahel" and content["tr"] == ["en"]
+    # Chaque segment est lu une fois : deux de la couche A, deux de la B.
+    assert len(content["r"]) == len(set(content["r"])) == 4
+    (variable,) = content["v"]
+    assert variable["n"] == "Exécution budgétaire"
+    assert variable["d"] == "Le budget est exécuté."
+    assert variable["s"] == "present" and len(variable["e"]) == 2
+    (pillar,) = content["p"]
+    assert pillar["n"] == "Budget et absorption" and pillar["v"] == ["V1"]
+    (results,) = repository.completed
+    assert len(results["readings"]) == 4
+    reading = results["readings"][0]
+    assert reading["interpretation"].startswith("Le projet exécute son budget⟦1⟧.")
+    assert reading["translations"]["en"].startswith("The project spends its budget⟦1⟧.")
+    assert len(reading["interpretation_citations"]) == 1 and reading["spans"]
+    (variable_row,) = results["variables"]
+    assert variable_row["interpretation"].startswith("Le projet suit son exécution⟦1⟧.")
+    assert len(variable_row["interpretation_citations"]) == 1
+    (score,) = results["scores"]
+    assert score["interpretation"].startswith("Le projet gère ses finances⟦1⟧.")
+    rules = results["rules"]["reading"]
+    assert rules["engine_version"] == "reading/1.0.0"
+    assert rules["ai"]["prompt"] == "read_evidences_v1.0"
+    assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
+    assert rules["summary"] == {
+        "readings": 4,
+        "variables": 1,
+        "pillars": 1,
+        "ai_status": "completed",
+        "ai_calls": 1,
+    }
+    reading_usage = next(
+        payload for payload in gateway.inserted if payload["source"] == "reading"
+    )
+    assert reading_usage["output_tokens"] == 900
+    assert repository.failures == []
+
+
+async def test_a_reading_failure_does_not_fail_the_run() -> None:
+    repository = _layer_c_repository()
+    reader = FakeReader(GradingUnavailable("AI_OUTPUT_TRUNCATED", "cut"))
+
+    await _reading_worker(repository, reader).run_once()
+
+    (results,) = repository.completed
+    assert results["readings"] == []
+    assert "interpretation" not in results["variables"][0]
+    assert results["rules"]["reading"]["ai"]["errors"] == ["AI_OUTPUT_TRUNCATED"]
+    # La restitution est rédigée quand même.
+    assert results["restitution"]["synthesis"]["status"] == "completed"
+    assert repository.failures == []

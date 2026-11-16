@@ -225,12 +225,16 @@ def test_all_alerts_fit_in_one_call_with_shared_extracts() -> None:
     (batch,) = build_batches(_inputs(), alerts, texts, RULES)
 
     assert [entry["r"] for entry in batch.content["a"]] == ["ALERT-01", "ALERT-06"]
-    assert batch.content["x"] == {"E1": "Extrait B.", "E2": "Extrait A."}
+    # Extraits en phrases : le message cite la phrase qui le fonde.
+    assert batch.content["x"] == {"E1": ["Extrait B."], "E2": ["Extrait A."]}
     assert batch.content["a"][0]["e"] == ["E1", "E2"]
     assert batch.content["a"][1]["e"] == ["E2"]
     assert batch.content["a"][0]["n"] == 1.0 and "d" not in batch.content["a"][0]
     assert batch.content["a"][1]["d"] == 22 and "c" not in batch.content["a"][1]
     assert batch.content["lang"] == "fr"
+    # Messages rédigés puis traduits (tr) dans le même appel.
+    assert batch.content["tr"] == ["en"]
+    assert batch.max_output_tokens == 2 * 320 * 2
 
 
 def test_an_extract_without_text_is_not_sent() -> None:
@@ -254,11 +258,22 @@ def test_the_ai_confirms_qualifies_or_infirms_each_gap() -> None:
     texts = known_texts(_layer_b(1.0)) | {A_SEGMENT: "Extrait A."}
     (batch,) = build_batches(_inputs(), alerts, texts, RULES)
 
+    message = (
+        "Le projet décrit son fonds de contrepartie [E2] et ses règles "
+        "d'attribution [E9]. Ses rapports ne mentionnent encore aucun "
+        "décaissement : le dispositif est conçu mais son fonctionnement reste "
+        "à vérifier dans les rapports financiers."
+    )
+    translated = (
+        "The project describes its matching fund [E2]. Its reports do not yet "
+        "mention any disbursement, so the facility is designed but its "
+        "operation remains to be checked in the financial reports."
+    )
     infirmed = interpret(
         batch,
         [
             RawQualification(
-                "A1", True, "majeure", "  Message rédigé par l'IA.  ", ("E9", "E2")
+                "A1", True, "majeure", message, ("E9", "E2"), {"en": translated}
             ),
             RawQualification("A1", False, "mineure", "doublon ignoré", ()),
             RawQualification("A2", False, "mineure", "", ()),
@@ -270,10 +285,33 @@ def test_the_ai_confirms_qualifies_or_infirms_each_gap() -> None:
     assert infirmed == {second.id}
     # Corpus pauvre (0,45) : mineure quoi que dise l'IA.
     assert first.severity == "mineure"
-    assert first.message == "Message rédigé par l'IA."
+    # E9 n'est pas proposé pour l'écart : sa référence disparaît.
+    assert first.message.startswith(
+        "Le projet décrit son fonds de contrepartie⟦1⟧ et ses règles "
+        "d'attribution. Ses rapports"
+    )
+    assert first.translations["en"].startswith(
+        "The project describes its matching fund⟦1⟧."
+    )
+    assert [source.segment_id for source in first.citations] == [A_SEGMENT]
     # Seul l'extrait proposé pour l'écart est retenu.
     assert first.segment_ids == [A_SEGMENT]
     assert first.qualified is True
+
+
+def test_a_short_message_keeps_the_rule_label() -> None:
+    (alert,) = detect(_inputs(), _layer_a(_score(62)), _layer_b(1.0), RULES)
+    texts = known_texts(_layer_b(1.0)) | {A_SEGMENT: "Extrait A."}
+    (batch,) = build_batches(_inputs(), [alert], texts, RULES)
+    label = alert.message
+
+    interpret(
+        batch, [RawQualification("A1", True, "majeure", "Écart [E1].", ("E1",))], RULES
+    )
+
+    assert alert.message == label
+    assert alert.citations == [] and alert.translations == {}
+    assert alert.qualified is True
 
 
 def test_an_unusable_answer_keeps_the_default_qualification() -> None:
@@ -303,6 +341,8 @@ def test_payload_matches_complete_run() -> None:
         "alert_type": "documentaire_sans_credibilite",
         "severity": "majeure",
         "message": alert.message,
+        "translations": {},
+        "citations": [],
         "qualified": False,
         "segment_ids": [str(B_SEGMENT), str(A_SEGMENT)],
     }

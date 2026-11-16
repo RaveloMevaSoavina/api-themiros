@@ -13,12 +13,20 @@ porte son bandeau en tête.
 
 Les preuves deviennent des notes numérotées, une par document et par page
 (US-22.4), dans l'ordre de leur première citation ; chaque élément renvoie à
-ses numéros, regroupés en plages. Une note cite les extraits les plus
-proches de ce qu'ils étayent (similarité), deux au plus.
+ses numéros, regroupés en plages. Une note donne d'abord la lecture de ses
+segments (interprétation), puis les extraits les plus proches de ce qu'ils
+étayent (similarité), deux au plus.
+
+Les textes de l'IA (interprétations des piliers, variables, réponses et
+preuves, justifications, écarts, synthèse) sont exportés dans la langue
+demandée, sinon dans leur langue de rédaction, sans leurs marqueurs ⟦n⟧ :
+leurs sources rejoignent les notes de l'élément qui les porte.
 
 Fonctions pures : aucune dépendance au stockage ni au réseau.
 """
 
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
@@ -27,6 +35,7 @@ from app.modules.exports.labels import labels_for
 from app.modules.runs.citations import plain
 
 EXCERPT_CHARS = 400
+BEFORE_MARKER = re.compile(r"[^\S\n]+(?=⟦)")
 EXCERPTS_PER_NOTE = 2
 Persona = str
 
@@ -46,6 +55,8 @@ class RunRows:
     items: list[dict[str, Any]]
     actions: list[dict[str, Any]]
     corpus_changed: bool
+    #: Réponses aux sous-questions (couche B), avec leurs interprétations.
+    answers: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +71,12 @@ class Note:
     subjects: list[str]
     #: Extraits de cette page retenus par le moteur, cités ou non.
     extracts: int
+    #: Lecture des segments cités de la page (une par segment), sans marqueur.
+    interpretations: list[str] = field(default_factory=list)
+
+    @property
+    def interpretation(self) -> str:
+        return "\n\n".join(self.interpretations)
 
     @property
     def excerpt(self) -> str:
@@ -79,6 +96,7 @@ class PillarScore:
     evolution: str | None
     confidence: float
     documents: int
+    interpretation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +109,7 @@ class VariableLine:
     documents: int
     confidence: float | None
     notes: list[int]
+    interpretation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +127,16 @@ class PillarResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AnswerLine:
+    """Réponse à une sous-question : statut et interprétation."""
+
+    question: str
+    status: str
+    interpretation: str | None
+    notes: list[int]
+
+
+@dataclass(frozen=True, slots=True)
 class CriterionResult:
     id: str
     code: str
@@ -119,6 +148,7 @@ class CriterionResult:
     justification: str | None
     ambiguous: bool
     notes: list[int]
+    answers: list[AnswerLine] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +340,30 @@ class Report:
         return empty.get(self.restitution_status or "missing", empty["missing"])
 
 
+def translated(text: str | None, translations: Any, locale: str) -> str | None:
+    """Texte de l'IA dans la langue demandée (`{langue: texte}`), sinon dans
+    sa langue de rédaction, sans ses marqueurs ⟦n⟧ ; `None` s'il est vide."""
+    if isinstance(translations, dict) and translations.get(locale):
+        text = translations[locale]
+    # L'espace avant un marqueur part avec lui : « établi ⟦1⟧. » → « établi. »
+    return plain(BEFORE_MARKER.sub("", text or "")).strip() or None
+
+
+def interpretation(row: dict[str, Any], locale: str) -> str | None:
+    return translated(
+        row.get("interpretation"), row.get("interpretation_translations"), locale
+    )
+
+
+def cited_ids(citations: Any) -> list[str]:
+    """Preuves des sources ⟦n⟧ d'un texte (`[{"e": preuve, "s": …}]`)."""
+    if not isinstance(citations, list):
+        return []
+    return [
+        str(item["e"]) for item in citations if isinstance(item, dict) and item.get("e")
+    ]
+
+
 def localized(row: dict[str, Any], locale: str, translations: str) -> dict[str, Any]:
     """Texte dans la langue demandée, sinon dans sa langue source
     (même règle que le dashboard)."""
@@ -332,9 +386,12 @@ class _Page:
 class _Citations:
     """Numérote les pages citées dans l'ordre de leur première citation."""
 
-    def __init__(self, evidences: dict[str, dict[str, Any]], subject) -> None:
+    def __init__(
+        self, evidences: dict[str, dict[str, Any]], subject, locale: str
+    ) -> None:
         self._evidences = evidences
         self._subject = subject
+        self._locale = locale
         self._pages: dict[tuple[str, Any], _Page] = {}
 
     @staticmethod
@@ -344,7 +401,7 @@ class _Citations:
             return ("evidence", row["id"])
         return (row["document_id"], row.get("page_number"))
 
-    def cite(self, evidence_ids: list[str]) -> list[int]:
+    def cite(self, evidence_ids: Iterable[str]) -> list[int]:
         numbers: set[int] = set()
         for evidence_id in evidence_ids:
             row = self._evidences.get(evidence_id)
@@ -372,6 +429,12 @@ class _Citations:
                 key=lambda row: -float(row.get("similarity") or 0),
             )
             excerpts: list[str] = []
+            # Une lecture par segment : la même sur ses preuves du run.
+            interpretations: list[str] = []
+            for row in ranked:
+                reading = interpretation(row, self._locale)
+                if reading and reading not in interpretations:
+                    interpretations.append(reading)
             for row in ranked:
                 excerpt = " ".join(str(row.get("excerpt") or "").split())
                 if len(excerpt) > EXCERPT_CHARS:
@@ -398,6 +461,7 @@ class _Citations:
                     excerpts=excerpts,
                     subjects=page.subjects,
                     extracts=len(page.rows),
+                    interpretations=interpretations,
                 )
             )
         return notes
@@ -409,6 +473,22 @@ def _number(value: Any) -> float | None:
 
 def _evidence_ids(row: dict[str, Any], table: str) -> list[str]:
     return [link["evidence_id"] for link in row.get(table) or []]
+
+
+def _question_text(question: dict[str, Any], locale: str) -> str:
+    """Texte d'une sous-question : celle du référentiel relue dans la langue
+    demandée (repli anglais, puis français), sinon le texte copié (même
+    règle que le dashboard)."""
+    translations = (
+        (question.get("ref_questions") or {}).get("ref_question_translations") or []
+        if question.get("origin") == "referential"
+        else []
+    )
+    for candidate in (locale, "en", "fr"):
+        for item in translations:
+            if item.get("locale") == candidate and item.get("text"):
+                return item["text"]
+    return question.get("text") or "—"
 
 
 def _layer_available(steps: list[dict[str, Any]], name: str) -> bool:
@@ -457,7 +537,7 @@ def build_report(
             return f"{pillar} · {label}"
         return pillar
 
-    citations = _Citations({row["id"]: row for row in rows.evidences}, subject)
+    citations = _Citations({row["id"]: row for row in rows.evidences}, subject, locale)
 
     # --- Couche A : un bloc par pilier, versions dans l'ordre ---------------
     scores_by_pillar: dict[str, list[PillarScore]] = {}
@@ -472,6 +552,7 @@ def build_report(
                 evolution=row.get("evolution_label"),
                 confidence=float(row.get("corpus_confidence") or 0),
                 documents=int(row.get("documents_count") or 0),
+                interpretation=interpretation(row, locale),
             )
         )
     pillars: list[PillarResult] = []
@@ -504,7 +585,9 @@ def build_report(
                             and evidence.get("variable_code") == code
                             and not evidence.get("criterion_id")
                         ]
+                        + cited_ids(row.get("interpretation_citations"))
                     ),
+                    interpretation=interpretation(row, locale),
                 )
             )
         pillars.append(
@@ -524,11 +607,44 @@ def build_report(
                         and not evidence.get("variable_code")
                         and not evidence.get("criterion_id")
                     ]
+                    # Sources des interprétations du pilier.
+                    + [
+                        evidence_id
+                        for row in rows.scores
+                        if row["pillar_id"] == pillar_id
+                        for evidence_id in cited_ids(
+                            row.get("interpretation_citations")
+                        )
+                    ]
                 ),
             )
         )
 
     # --- Couche B ------------------------------------------------------------
+    def answers(criterion_id: str) -> list[AnswerLine]:
+        """Réponses aux sous-questions du critère, dans l'ordre du cadre ;
+        citées après le critère, pour la numérotation des notes."""
+        return [
+            AnswerLine(
+                question=_question_text(row["sub_questions"], locale),
+                status=row.get("status") or "",
+                interpretation=interpretation(row, locale),
+                notes=citations.cite(
+                    _evidence_ids(row, "sub_answer_evidences")
+                    + cited_ids(row.get("interpretation_citations"))
+                ),
+            )
+            for row in sorted(
+                (
+                    item
+                    for item in rows.answers
+                    if (item.get("sub_questions") or {}).get("criterion_id")
+                    == criterion_id
+                ),
+                key=lambda item: item["sub_questions"].get("order_index") or 0,
+            )
+        ]
+
     criteria = [
         CriterionResult(
             id=row["criterion_id"],
@@ -539,7 +655,11 @@ def build_report(
             documented=int(row.get("documented_sub_questions") or 0),
             total=int(row.get("total_sub_questions") or 0),
             # Sources du texte : les notes du critère les portent déjà.
-            justification=plain(row.get("justification")) or None,
+            justification=translated(
+                row.get("justification"),
+                row.get("justification_translations"),
+                locale,
+            ),
             ambiguous=bool(row.get("ambiguity_flag")),
             notes=citations.cite(
                 [
@@ -547,7 +667,9 @@ def build_report(
                     for evidence in rows.evidences
                     if evidence.get("criterion_id") == row["criterion_id"]
                 ]
+                + cited_ids(row.get("citations"))
             ),
+            answers=answers(row["criterion_id"]),
         )
         for row in sorted(
             rows.notes,
@@ -581,12 +703,16 @@ def build_report(
                 rule=row.get("rule_code") or "",
                 type=row.get("alert_type") or "",
                 severity=row["severity"],
-                message=row.get("message") or "",
+                message=translated(row.get("message"), row.get("translations"), locale)
+                or "",
                 qualified=bool(row.get("qualified")),
                 status=row["status"],
                 comment=row.get("instruction_comment"),
                 scope=scope or "—",
-                notes=citations.cite(_evidence_ids(row, "alert_evidences")),
+                notes=citations.cite(
+                    _evidence_ids(row, "alert_evidences")
+                    + cited_ids(row.get("citations"))
+                ),
             )
         )
 

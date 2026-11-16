@@ -2,13 +2,16 @@
 
 - notation des sous-questions de la couche B (prompt grade_sub_questions) ;
 - qualification des écarts de la couche C (prompt detect_incoherence) ;
+- lecture des documents : segments, variables et piliers (prompt
+  read_evidences) ;
 - rédaction de la restitution (prompt formulate_restitution).
 
-Un appel par lot (un seul lot en pratique). Toute défaillance (IA
-désactivée, réseau, réponse invalide, plafond de coût) lève
-`GradingUnavailable` : les critères du lot restent non conclus, les écarts
-gardent leur qualification par défaut, la synthèse ses libellés factuels ;
-le run continue.
+Un appel par lot (un seul lot en pratique). Chaque appel produit aussi les
+traductions de ses textes (`tr`). Toute défaillance (IA désactivée,
+réseau, réponse invalide, plafond de coût) lève `GradingUnavailable` : les
+critères du lot restent non conclus, les écarts gardent leur qualification
+par défaut, les preuves restent sans lecture, la synthèse garde ses
+libellés factuels ; le run continue.
 """
 
 from dataclasses import dataclass
@@ -20,8 +23,14 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
-from app.modules.runs.layer_b import GradingBatch, RawGrade, RawGrading
+from app.modules.runs.layer_b import (
+    GradingBatch,
+    RawGrade,
+    RawGrading,
+    RawGradingTranslation,
+)
 from app.modules.runs.layer_c import QualificationBatch, RawQualification
+from app.modules.runs.reading import RawReading, RawReadingTranslation, ReadingBatch
 from app.modules.runs.restitution import (
     PERSONA_KEYS,
     RawAction,
@@ -43,10 +52,10 @@ class GradingUnavailable(Exception):
 
 
 # Schéma de sortie compact : identifiants courts, une lettre par champ.
-class LlmReading(BaseModel):
-    """Interprétation d'un extrait : son identifiant e, le texte t."""
+class LlmTranslatedItem(BaseModel):
+    """Un texte par identifiant : k, le texte t."""
 
-    e: str
+    k: str
     t: str
 
 
@@ -55,7 +64,8 @@ class LlmGrade(BaseModel):
     n: int | None
     e: list[str]
     c: bool
-    i: list[LlmReading]
+    # Interprétation de la réponse (un paragraphe).
+    t: str
 
 
 class LlmCriterionJustification(BaseModel):
@@ -63,9 +73,16 @@ class LlmCriterionJustification(BaseModel):
     j: str
 
 
+class LlmGradingTranslation(BaseModel):
+    l: str  # noqa: E741 (clé courte du schéma)
+    q: list[LlmTranslatedItem]
+    c: list[LlmCriterionJustification]
+
+
 class LlmGradingOutput(BaseModel):
     q: list[LlmGrade]
     c: list[LlmCriterionJustification]
+    tr: list[LlmGradingTranslation]
 
 
 class LlmAlert(BaseModel):
@@ -76,8 +93,35 @@ class LlmAlert(BaseModel):
     e: list[str]
 
 
+class LlmAlertMessage(BaseModel):
+    k: str
+    m: str
+
+
+class LlmAlertTranslation(BaseModel):
+    l: str  # noqa: E741 (clé courte du schéma)
+    a: list[LlmAlertMessage]
+
+
 class LlmQualificationOutput(BaseModel):
     a: list[LlmAlert]
+    tr: list[LlmAlertTranslation]
+
+
+class LlmReadingTranslation(BaseModel):
+    l: str  # noqa: E741 (clé courte du schéma)
+    s: list[LlmTranslatedItem]
+    v: list[LlmTranslatedItem]
+    p: list[LlmTranslatedItem]
+
+
+class LlmReadingOutput(BaseModel):
+    """Lecture des extraits (s), des variables (v) et des piliers (p)."""
+
+    s: list[LlmTranslatedItem]
+    v: list[LlmTranslatedItem]
+    p: list[LlmTranslatedItem]
+    tr: list[LlmReadingTranslation]
 
 
 class LlmRestitutionItem(BaseModel):
@@ -99,11 +143,6 @@ class LlmRestitutionAction(BaseModel):
     ana: LlmProjection
 
 
-class LlmTranslatedItem(BaseModel):
-    k: str
-    t: str
-
-
 class LlmTranslatedAction(BaseModel):
     k: str
     dec: LlmProjection
@@ -118,15 +157,12 @@ class LlmRestitutionTranslation(BaseModel):
     i: list[LlmTranslatedItem]
     c: str
     a: list[LlmTranslatedAction]
-    x: list[LlmTranslatedItem]
 
 
 class LlmRestitutionOutput(BaseModel):
     i: list[LlmRestitutionItem]
     c: str
     a: list[LlmRestitutionAction]
-    # Interprétation de chaque extrait (k : son identifiant).
-    x: list[LlmTranslatedItem]
     tr: list[LlmRestitutionTranslation]
 
 
@@ -154,6 +190,12 @@ class RestitutionWriter(Protocol):
     async def write(
         self, prompt: dict[str, Any], batch: RestitutionBatch
     ) -> tuple[RawRestitution, AiUsage]: ...
+
+
+class EvidenceReader(Protocol):
+    async def read(
+        self, prompt: dict[str, Any], batch: ReadingBatch
+    ) -> tuple[RawReading, AiUsage]: ...
 
 
 def ai_cost(settings: Settings, input_tokens: int, output_tokens: int) -> Decimal:
@@ -280,16 +322,17 @@ class OpenAISubQuestionGrader(OpenAIStructuredCall):
         return (
             RawGrading(
                 grades=tuple(
-                    RawGrade(
-                        item.k,
-                        item.n,
-                        tuple(item.e),
-                        item.c,
-                        {reading.e: reading.t for reading in item.i},
-                    )
+                    RawGrade(item.k, item.n, tuple(item.e), item.c, item.t)
                     for item in parsed.q
                 ),
                 justifications={item.k: item.j for item in parsed.c},
+                translations={
+                    translation.l: RawGradingTranslation(
+                        interpretations={item.k: item.t for item in translation.q},
+                        justifications={item.k: item.j for item in translation.c},
+                    )
+                    for translation in parsed.tr
+                },
             ),
             usage,
         )
@@ -307,9 +350,25 @@ class OpenAIAlertQualifier(OpenAIStructuredCall):
             batch.max_output_tokens,
             2000,
         )
+        # Langue -> identifiant -> message traduit.
+        translated = {
+            translation.l: {item.k: item.m for item in translation.a}
+            for translation in parsed.tr
+        }
         return (
             [
-                RawQualification(item.k, item.ok, item.g, item.m, tuple(item.e))
+                RawQualification(
+                    item.k,
+                    item.ok,
+                    item.g,
+                    item.m,
+                    tuple(item.e),
+                    {
+                        locale: messages[item.k]
+                        for locale, messages in translated.items()
+                        if item.k in messages
+                    },
+                )
                 for item in parsed.a
             ],
             usage,
@@ -334,7 +393,6 @@ class OpenAIRestitutionWriter(OpenAIStructuredCall):
                     RawItem(item.k, item.t, tuple(item.e)) for item in parsed.i
                 ),
                 conclusion=parsed.c,
-                readings={item.k: item.t for item in parsed.x},
                 actions=tuple(
                     RawAction(
                         item.k,
@@ -352,7 +410,6 @@ class OpenAIRestitutionWriter(OpenAIStructuredCall):
                     translation.l: RawTranslation(
                         items={item.k: item.t for item in translation.i},
                         conclusion=translation.c,
-                        readings={item.k: item.t for item in translation.x},
                         actions={
                             item.k: {
                                 persona: RawProjection(
@@ -362,6 +419,36 @@ class OpenAIRestitutionWriter(OpenAIStructuredCall):
                             }
                             for item in translation.a
                         },
+                    )
+                    for translation in parsed.tr
+                },
+            ),
+            usage,
+        )
+
+
+class OpenAIEvidenceReader(OpenAIStructuredCall):
+    async def read(
+        self, prompt: dict[str, Any], batch: ReadingBatch
+    ) -> tuple[RawReading, AiUsage]:
+        parsed, usage = await self._parse(
+            prompt,
+            batch.message(),
+            LlmReadingOutput,
+            batch.estimated_input_tokens,
+            batch.max_output_tokens,
+            8000,
+        )
+        return (
+            RawReading(
+                segments={item.k: item.t for item in parsed.s},
+                variables={item.k: item.t for item in parsed.v},
+                pillars={item.k: item.t for item in parsed.p},
+                translations={
+                    translation.l: RawReadingTranslation(
+                        segments={item.k: item.t for item in translation.s},
+                        variables={item.k: item.t for item in translation.v},
+                        pillars={item.k: item.t for item in translation.p},
                     )
                     for translation in parsed.tr
                 },
@@ -391,3 +478,10 @@ def build_restitution_writer(settings: Settings) -> RestitutionWriter | None:
     if settings.ai_provider != "openai" or not settings.openai_api_key:
         return None
     return OpenAIRestitutionWriter(settings)
+
+
+def build_evidence_reader(settings: Settings) -> EvidenceReader | None:
+    """`None` quand l'IA est désactivée : les preuves restent sans lecture."""
+    if settings.ai_provider != "openai" or not settings.openai_api_key:
+        return None
+    return OpenAIEvidenceReader(settings)

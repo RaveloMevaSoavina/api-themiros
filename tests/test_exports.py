@@ -381,6 +381,171 @@ def test_the_restitution_follows_the_export_language() -> None:
     assert french.actions[0].text == "Documenter le suivi du comité."
 
 
+def interpreted_rows() -> dict:
+    """Run aux interprétations en paragraphes, traduites et sourcées."""
+    base = rows()
+    sources = [{"e": "e1", "s": [[0, 20]]}]
+    return {
+        "scores": [
+            {
+                **base.scores[0],
+                "interpretation": (
+                    "Le pilotage est établi ⟦1⟧.\n\nLe suivi reste partiel."
+                ),
+                "interpretation_translations": {"en": "Steering is in place ⟦1⟧."},
+                "interpretation_citations": sources,
+            },
+            base.scores[1],
+        ],
+        "variables": [
+            {
+                **base.variables[0],
+                "interpretation": "Le comité se réunit ⟦1⟧.",
+                "interpretation_translations": {},
+                "interpretation_citations": sources,
+            },
+            base.variables[1],
+        ],
+        "notes": [
+            {
+                **base.notes[0],
+                "justification": "Le comité se réunit chaque trimestre ⟦1⟧.",
+                "justification_translations": {"en": "The committee meets ⟦1⟧."},
+                "citations": [{"e": "e2", "s": []}],
+            },
+            base.notes[1],
+        ],
+        "answers": [
+            {
+                "id": "sa2",
+                "status": "non_documentee",
+                "interpretation": None,
+                "interpretation_translations": {},
+                "interpretation_citations": [],
+                "sub_questions": {
+                    "text": "Les risques sont-ils suivis ?",
+                    "criterion_id": "c1",
+                    "origin": "user",
+                    "order_index": 2,
+                    "ref_questions": None,
+                },
+                "sub_answer_evidences": [],
+            },
+            {
+                "id": "sa1",
+                "status": "documentee",
+                "interpretation": "Les résultats restent partiels ⟦1⟧.",
+                "interpretation_translations": {"en": "Results remain partial ⟦1⟧."},
+                "interpretation_citations": [{"e": "e2", "s": [[0, 10]]}],
+                "sub_questions": {
+                    "text": "Résultats atteints ?",
+                    "criterion_id": "c1",
+                    "origin": "referential",
+                    "order_index": 1,
+                    "ref_questions": {
+                        "ref_question_translations": [
+                            {"locale": "en", "text": "Are results achieved?"},
+                            {
+                                "locale": "fr",
+                                "text": "Les résultats sont-ils atteints ?",
+                            },
+                        ]
+                    },
+                },
+                "sub_answer_evidences": [{"evidence_id": "e2"}],
+            },
+        ],
+        "alerts": [
+            {
+                **base.alerts[0],
+                "message": "Le score est élevé ⟦1⟧, la note faible ⟦2⟧.",
+                "translations": {"en": "High score ⟦1⟧, low rating ⟦2⟧."},
+                "citations": [{"e": "e1", "s": []}, {"e": "e2", "s": []}],
+            }
+        ],
+        "evidences": [
+            {
+                **base.evidences[0],
+                "interpretation": "Le comité se réunit régulièrement ⟦1⟧.",
+                "interpretation_translations": {"en": "The committee meets ⟦1⟧."},
+            },
+            base.evidences[1],
+        ],
+    }
+
+
+def test_interpretations_follow_the_export_language_without_markers() -> None:
+    french = report(**interpreted_rows())
+    english = report(locale="en", **interpreted_rows())
+
+    pillar = french.pillars[0]
+    assert pillar.latest.interpretation == (
+        "Le pilotage est établi.\n\nLe suivi reste partiel."
+    )
+    assert english.pillars[0].latest.interpretation == "Steering is in place."
+    assert pillar.variables[0].interpretation == "Le comité se réunit."
+    # Sans traduction dans la langue demandée : le texte d'origine.
+    assert english.pillars[0].variables[0].interpretation == "Le comité se réunit."
+    assert pillar.variables[1].interpretation is None
+    criterion = french.criteria[1]
+    assert criterion.justification == "Le comité se réunit chaque trimestre."
+    assert english.criteria[1].justification == "The committee meets."
+    assert [answer.question for answer in criterion.answers] == [
+        "Les résultats sont-ils atteints ?",
+        "Les risques sont-ils suivis ?",
+    ]
+    assert english.criteria[1].answers[0].question == "Are results achieved?"
+    assert criterion.answers[0].interpretation == "Les résultats restent partiels."
+    assert english.criteria[1].answers[0].interpretation == "Results remain partial."
+    assert criterion.answers[1].interpretation is None
+    assert french.alerts[0].message == "Le score est élevé, la note faible."
+    assert english.alerts[0].message == "High score, low rating."
+    assert french.notes[0].interpretations == ["Le comité se réunit régulièrement."]
+    assert english.notes[0].interpretation == "The committee meets."
+
+
+def test_sources_of_interpretations_join_the_notes() -> None:
+    built = report(**interpreted_rows())
+
+    # Le pilier cite e1 (page 1) par son interprétation ; l'écart, e1 et e2.
+    assert built.pillars[0].notes == [1]
+    assert built.criteria[1].answers[0].notes == [2]
+    assert built.criteria[1].answers[1].notes == []
+    assert built.alerts[0].notes == [1, 2]
+
+
+def test_every_format_exports_the_interpretations() -> None:
+    built = report(**interpreted_rows())
+    pdf = "".join(page.get_text() for page in pymupdf.open("pdf", render_pdf(built)))
+    docx = "\n".join(
+        paragraph.text
+        for paragraph in Document(io.BytesIO(render_docx(built))).paragraphs
+    )
+    workbook = load_workbook(io.BytesIO(render_xlsx(built)))
+    csv_text = render_csv(built).decode("utf-8-sig")
+
+    for text in (docx, csv_text):
+        for expected in (
+            "Le pilotage est établi.",
+            "Le comité se réunit.",
+            "Les résultats restent partiels.",
+            "Le score est élevé, la note faible.",
+            "Le comité se réunit régulièrement.",
+        ):
+            assert expected in text
+        assert "⟦" not in text
+    assert "Le suivi reste partiel." in pdf
+    assert "Les résultats sont-ils atteints ?" in pdf
+    assert "⟦" not in pdf
+    answers = workbook["Sous-questions"]
+    assert answers["C2"].value == "Les résultats sont-ils atteints ?"
+    assert answers["E2"].value == "Les résultats restent partiels."
+    assert workbook["Comparatif"]["H2"].value == (
+        "Le pilotage est établi.\n\nLe suivi reste partiel."
+    )
+    assert workbook["Preuves"]["F2"].value == "Le comité se réunit régulièrement."
+
+
 def test_pdf_opens_with_exploratory_banner_first() -> None:
     document = pymupdf.open("pdf", render_pdf(report()))
     first_page = document[0].get_text()
@@ -439,6 +604,7 @@ def test_xlsx_has_one_sheet_per_screen() -> None:
         "Comparatif",
         "Variables",
         "Critères",
+        "Sous-questions",
         "Alertes",
         "Synthèse",
         "Plan d'action",

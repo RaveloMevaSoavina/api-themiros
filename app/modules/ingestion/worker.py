@@ -24,6 +24,7 @@ from app.modules.ingestion.pipeline import IngestionPipeline, lease_lost
 from app.modules.ingestion.repository import ClaimedJob, IngestionRepository
 from app.modules.runs.grader import (
     build_alert_qualifier,
+    build_evidence_reader,
     build_restitution_writer,
     build_sub_question_grader,
 )
@@ -185,6 +186,7 @@ async def _main() -> None:
             grader=build_sub_question_grader(settings),
             qualifier=build_alert_qualifier(settings),
             writer=build_restitution_writer(settings),
+            reader=build_evidence_reader(settings),
         )
 
         def stop() -> None:

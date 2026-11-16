@@ -23,12 +23,13 @@ Déroulé, pour un run :
    formulate_restitution), extraits dédoublonnés et découpés en phrases,
    identifiants courts (P1, W1, V1, N1, E1). Le volume est borné par
    construction (neuf puces, six actions) : jamais plus d'un appel ;
-3. `interpret` : l'IA rédige chaque puce, la conclusion prudente et chaque
-   action avec ses trois projections persona, en citant dans le texte les
-   phrases des extraits proposés pour elle (`citations`), et interprète
-   chaque extrait en une phrase, lue à la place de l'extrait brut, qui cite
-   ses propres phrases. Une action sans ses trois projections n'est pas
-   publiée (RG-4).
+3. `interpret` : l'IA rédige chaque constat en paragraphe, la conclusion
+   prudente et chaque action avec ses trois projections persona (l'action
+   et sa raison, un paragraphe), en citant dans le texte les phrases des
+   extraits proposés pour elle (`citations`). Un constat trop court garde
+   son libellé factuel ; une action sans ses trois projections, ou dont une
+   raison est trop courte, n'est pas publiée (RG-4). Les extraits sont lus
+   par l'étape de lecture (`reading`), une fois par run.
 
 Le projet évalué (`pj`) accompagne le message : tous ces textes parlent
 de lui, pas des piliers, des critères ni de leurs scores, affichés à côté.
@@ -48,20 +49,18 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from app.modules.evidences.passages import Span, merge
+from app.modules.evidences.passages import Span
 from app.modules.frameworks.schemas import INTERFACE_LOCALES
 from app.modules.runs.citations import (
     Citations,
     Excerpt,
-    Reading,
     Source,
     cited,
     compact,
     cut,
     excerpt,
     fit,
-    plain,
-    read,
+    long_enough,
     references,
 )
 from app.modules.runs.citations import truncate as truncate_cited
@@ -70,13 +69,15 @@ from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.layer_c import Alert, LayerCInputs, ordered_segments
 from app.modules.runs.project import ProjectContext
 
-RESTITUTION_VERSION = "restitution/1.5.0"
+RESTITUTION_VERSION = "restitution/1.6.0"
 PROMPT_CODE = "formulate_restitution"
 # v1.2 : le même appel traduit aussi la restitution dans les autres langues
 # de l'interface (`tr`). v1.3 : extraits en phrases, sources citées dans le
 # texte, interprétation de chaque extrait (`x`). v1.4 : le projet évalué
-# (`pj`), sujet de tous les textes ; interprétations sourcées.
-PROMPT_VERSION = "v1.4"
+# (`pj`), sujet de tous les textes ; interprétations sourcées. v1.5 :
+# constats et raisons des actions en paragraphes ; les extraits sont lus
+# par l'étape de lecture.
+PROMPT_VERSION = "v1.5"
 
 Section = Literal["progres", "faiblesse", "a_verifier"]
 # Rédaction de la synthèse : faite, inutile (aucun constat), IA désactivée,
@@ -89,24 +90,23 @@ PERSONA_KEYS = {"decideur": "dec", "pmu": "pmu", "analyste": "ana"}
 
 # Mêmes estimations que les couches B et C (~3 caractères par token).
 CHARS_PER_TOKEN = 3
-SYSTEM_PROMPT_TOKENS = 1300
-OUTPUT_TOKENS_PER_ITEM = 70
-OUTPUT_TOKENS_PER_ACTION = 650
+SYSTEM_PROMPT_TOKENS = 1500
+OUTPUT_TOKENS_PER_ITEM = 300
+OUTPUT_TOKENS_PER_ACTION = 1300
 OUTPUT_TOKENS_CONCLUSION = 650
-OUTPUT_TOKENS_PER_READING = 75
-ITEM_CHARS = 240
-# Le prompt (v1.1) demande 1 800 caractères pour la conclusion et 300 pour
-# une action ou sa raison : ces plafonds ne coupent qu'un dépassement net.
+# Le prompt (v1.5) demande 1 800 caractères pour la conclusion, 350 à 800
+# pour un constat, 450 pour une action et 300 à 700 pour sa raison : ces
+# plafonds ne coupent qu'un dépassement net. Sous les minimums, une phrase
+# de circonstance n'est pas publiée.
+ITEM_CHARS = 900
+ITEM_MIN_CHARS = 150
 CONCLUSION_CHARS = 2400
-PROJECTION_CHARS = 450
-# Le prompt (v1.4) demande 160 caractères hors sources pour l'interprétation
-# d'un extrait.
-READING_CHARS = 220
-READING_MAX_CHARS = 400
+PROJECTION_CHARS = 850
+REASON_MIN_CHARS = 120
 # Plafonds de la base, marqueurs de sources compris.
-ITEM_MAX_CHARS = 300
+ITEM_MAX_CHARS = 1500
 CONCLUSION_MAX_CHARS = 3000
-PROJECTION_MAX_CHARS = 600
+PROJECTION_MAX_CHARS = 1500
 
 # « Recommandée parce que » est ajouté à l'affichage.
 BECAUSE = re.compile(
@@ -222,8 +222,6 @@ class RawTranslation:
     conclusion: str
     # Identifiant -> persona -> formulation.
     actions: Mapping[str, Mapping[str, RawProjection]]
-    # Identifiant d'extrait -> interprétation.
-    readings: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,8 +233,6 @@ class RawRestitution:
     actions: tuple[RawAction, ...]
     # Langue -> traduction ; seules les langues demandées (`tr`) comptent.
     translations: Mapping[str, RawTranslation] = field(default_factory=dict)
-    # Identifiant d'extrait -> interprétation.
-    readings: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -272,8 +268,6 @@ class Restitution:
     locale: str | None = None
     conclusion_translations: dict[str, str] = field(default_factory=dict)
     conclusion_citations: list[Source] = field(default_factory=list)
-    # Segment cité -> interprétation de l'extrait.
-    readings: dict[UUID, Reading] = field(default_factory=dict)
 
     @property
     def status(self) -> Status:
@@ -361,18 +355,6 @@ class Restitution:
                     ],
                 }
                 for position, action in enumerate(self.actions, start=1)
-            ],
-            "readings": [
-                {
-                    "segment_id": str(segment_id),
-                    "interpretation": reading.text,
-                    "translations": reading.translations,
-                    "interpretation_citations": [
-                        source.as_dict() for source in reading.citations
-                    ],
-                    "spans": [list(span) for span in reading.spans] or None,
-                }
-                for segment_id, reading in self.readings.items()
             ],
         }
 
@@ -743,7 +725,6 @@ def build_batch(
         OUTPUT_TOKENS_CONCLUSION
         + OUTPUT_TOKENS_PER_ITEM * items
         + OUTPUT_TOKENS_PER_ACTION * len(batch.origins)
-        + OUTPUT_TOKENS_PER_READING * len(batch.excerpts)
     )
     return batch
 
@@ -787,7 +768,7 @@ def _projection(
     if projection is None or not projection.text.strip():
         return None
     reason = _reason(citations.cite(projection.justification, allowed))
-    if not plain(reason).strip():
+    if not long_enough(reason, REASON_MIN_CHARS):
         return None
     return {
         "text": truncate_cited(
@@ -845,14 +826,18 @@ def interpret(
         allowed = batch.allowed.get(item.key, frozenset())
         citations = Citations(batch.excerpts)
         text = _written(item.text, citations, allowed, ITEM_CHARS)
-        if text:
+        if text and long_enough(text, ITEM_MIN_CHARS):
             translated = {
                 locale: _written(
                     translation.items.get(item.key), citations, allowed, ITEM_CHARS
                 )
                 for locale, translation in translations.items()
             }
-            locales = [locale for locale, value in translated.items() if value]
+            locales = [
+                locale
+                for locale, value in translated.items()
+                if long_enough(value, ITEM_MIN_CHARS)
+            ]
             texts, finding.citations = compact(
                 [text, *(translated[locale] for locale in locales)],
                 citations.sources,
@@ -987,35 +972,4 @@ def interpret(
         )
     restitution.actions = [actions[key] for key in batch.origins if key in actions]
 
-    # Interprétation des extraits : lue à la place de l'extrait brut ; ses
-    # sources sont ses propres phrases, à défaut celles que citent les
-    # autres textes.
-    for raw_key, text in raw.readings.items():
-        key = raw_key.strip().upper()
-        item = batch.excerpts.get(key)
-        if item is None or item.segment_id in restitution.readings:
-            continue
-        reading = read(
-            key,
-            text,
-            {
-                locale: translation.readings.get(raw_key)
-                for locale, translation in translations.items()
-            },
-            batch.excerpts,
-            READING_CHARS,
-            READING_MAX_CHARS,
-            fallback=spans.get(key, ()),
-        )
-        if reading is None:
-            continue
-        reading.spans = tuple(
-            merge(
-                [
-                    *spans.get(key, ()),
-                    *(span for source in reading.citations for span in source.spans),
-                ]
-            )
-        )
-        restitution.readings[item.segment_id] = reading
     restitution.qualified = True

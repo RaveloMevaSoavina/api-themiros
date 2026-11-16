@@ -9,6 +9,7 @@ from app.modules.runs.layer_b import (
     LayerBRules,
     RawGrade,
     RawGrading,
+    RawGradingTranslation,
     SubQuestion,
     build_batches,
     finalize,
@@ -20,6 +21,14 @@ from app.modules.runs.project import ProjectContext
 
 RULES = LayerBRules(min_similarity=0.4)
 DOCUMENTS = [uuid4(), uuid4()]
+# Une justification argumentée : un paragraphe sourcé.
+JUSTIFIED = (
+    "Le projet aligne ses activités sur les priorités nationales [E1] et ses "
+    "rapports annuels détaillent les zones ciblées, les publics visés et les "
+    "moyens consacrés à chacun. Les documents donnent ainsi une lecture "
+    "cohérente de son ancrage, sans encore montrer comment ces priorités "
+    "orientent ses arbitrages budgétaires."
+)
 
 
 def _criterion(name: str, questions: int, applicability: str = "obligatoire"):
@@ -116,7 +125,10 @@ def test_the_whole_run_fits_in_one_call_with_shared_extracts() -> None:
         "p": "Rapport de suivi",
     }
     assert batch.estimated_input_tokens > 0
-    assert batch.max_output_tokens == 4 * 120 + 2 * 150
+    # Interprétations et justifications, rédigées puis traduites (tr).
+    assert content["tr"] == ["en"]
+    assert batch.locales == ("en",)
+    assert batch.max_output_tokens == 2 * (4 * 260 + 2 * 480)
 
 
 def test_extracts_are_capped_and_truncated() -> None:
@@ -168,7 +180,7 @@ def test_ratings_average_the_documented_sub_questions() -> None:
             RawGrade(keys[1], 2, ("E2",), False),
             RawGrade(keys[2], None, (), False),
         ),
-        justifications={"C1": "Les extraits montrent un alignement net."},
+        justifications={"C1": JUSTIFIED},
     )
 
     interpret(batch, raw, grading)
@@ -178,7 +190,9 @@ def test_ratings_average_the_documented_sub_questions() -> None:
     assert note.status == "conclu"
     assert note.note == 2.5
     assert (note.documented, note.total) == (2, 3)
-    assert note.justification == "Les extraits montrent un alignement net."
+    assert note.justification.startswith(
+        "Le projet aligne ses activités sur les priorités nationales⟦1⟧ et ses"
+    )
     assert not note.ambiguous
     statuses = [answer.status for answer in results.answers]
     assert statuses == ["documentee", "documentee", "non_documentee"]
@@ -285,7 +299,7 @@ def test_truncate_cuts_on_a_word() -> None:
     assert truncate("alpha beta gamma delta", 12) == "alpha beta…"
 
 
-def test_cited_sentences_and_readings_follow_each_evidence() -> None:
+def test_interpretations_and_justifications_cite_their_sources() -> None:
     criterion = _criterion("Pertinence", 1)
     question = criterion.questions[0]
     text = (
@@ -303,75 +317,105 @@ def test_cited_sentences_and_readings_follow_each_evidence() -> None:
             "Le comité valide le plan chaque année.",
         ]
     }
+    interpretation = (
+        "Le projet soumet son plan à la validation annuelle de son comité "
+        "[E1.2, E3], ce qui montre une instance de pilotage en place. Les "
+        "documents ne disent pas ce que le comité modifie dans le plan."
+    )
+    translated = (
+        "The project submits its plan to its board every year [E1.2]. The "
+        "documents do not say what the board changes in the plan itself."
+    )
+    justification = (
+        "Le plan est validé chaque année [E1.2, E5] et le projet se réfère "
+        "explicitement aux priorités nationales [E1.1]. Ces éléments montrent "
+        "une conception alignée, mais les documents ne disent rien de la "
+        "manière dont les besoins des bénéficiaires ont été recueillis."
+    )
     raw = RawGrading(
-        grades=(
-            RawGrade(
-                "Q1",
-                3,
-                ("E1.2",),
-                False,
-                {"E1.2": "Le projet fait valider son plan [E1.2, E3].", "E7": "?"},
-            ),
-        ),
-        justifications={"C1": "Le plan est validé chaque année [E1.2, E5]."},
+        grades=(RawGrade("Q1", 3, ("E1.2",), False, interpretation),),
+        justifications={"C1": justification},
+        translations={
+            "en": RawGradingTranslation(interpretations={"Q1": translated}),
+            "pt": RawGradingTranslation(interpretations={"Q1": translated}),
+        },
     )
     grading = Grading()
 
     interpret(batch, raw, grading)
     results = finalize(_inputs(criterion), retrieved, grading, RULES)
 
+    first = (0, text.index(" Le comité"))
     second = (text.index("Le comité"), len(text))
     (answer,) = results.answers
     assert answer.spans == {segment: (second,)}
-    # Une interprétation ne cite que ses propres phrases : E3 disparaît.
-    reading = answer.readings[segment]
-    assert reading.text == "Le projet fait valider son plan⟦1⟧."
+    # E3 n'est pas un extrait de la sous-question : sa référence disparaît.
+    reading = answer.interpretation
+    assert reading is not None
+    assert reading.text.startswith(
+        "Le projet soumet son plan à la validation annuelle de son comité⟦1⟧, ce"
+    )
+    # Seule la langue demandée (tr) compte.
+    assert set(reading.translations) == {"en"}
+    assert reading.translations["en"].startswith(
+        "The project submits its plan to its board every year⟦1⟧."
+    )
     assert [source.as_dict() for source in reading.citations] == [
         {"segment_id": str(segment), "spans": [list(second)]}
     ]
     (note,) = results.notes
-    # E5 n'est pas un extrait du critère : seule la source E1.2 reste.
-    assert note.justification == "Le plan est validé chaque année⟦1⟧."
-    assert [source.as_dict() for source in note.citations] == [
-        {"segment_id": str(segment), "spans": [list(second)]}
-    ]
-    payload = results.payload()
-    assert (
-        payload["evidences"][0]["interpretation"]
-        == "Le projet fait valider son plan⟦1⟧."
+    # E5 n'est pas un extrait du critère : seules ses sources E1 restent.
+    assert note.justification.startswith(
+        "Le plan est validé chaque année⟦1⟧ et le projet se réfère "
+        "explicitement aux priorités nationales⟦2⟧."
     )
-    assert payload["evidences"][0]["interpretation_citations"] == [
+    payload = results.payload()
+    assert payload["answers"][0]["interpretation"] == reading.text
+    assert payload["answers"][0]["interpretation_translations"] == {
+        "en": reading.translations["en"]
+    }
+    assert payload["answers"][0]["interpretation_citations"] == [
         {"segment_id": str(segment), "spans": [list(second)]}
     ]
+    # La lecture de l'extrait vient de l'étape de lecture, pas d'ici.
+    assert "interpretation" not in payload["evidences"][0]
     assert payload["evidences"][0]["spans"] == [list(second)]
     assert payload["notes"][0]["citations"] == [
-        {"segment_id": str(segment), "spans": [list(second)]}
+        {"segment_id": str(segment), "spans": [list(second)]},
+        {"segment_id": str(segment), "spans": [list(first)]},
     ]
+    assert payload["notes"][0]["justification_translations"] == {}
 
 
-def test_a_reading_without_source_points_to_the_sentences_of_its_grade() -> None:
+def test_a_short_or_unsourced_text_is_not_published() -> None:
     criterion = _criterion("Pertinence", 1)
     question = criterion.questions[0]
     text = "Le projet cible trois régions. Le comité valide le plan chaque année."
-    segment = uuid4()
     retrieved = retrieve(
-        [Candidate(question.id, segment, DOCUMENTS[0], 0.6, text)], RULES
+        [Candidate(question.id, uuid4(), DOCUMENTS[0], 0.6, text)], RULES
     )
     (batch,) = build_batches(_inputs(criterion), retrieved, RULES)
+    unsourced = (
+        "Le projet concentre son action sur un nombre restreint de régions, "
+        "ce qui facilite son pilotage, mais les documents ne précisent pas "
+        "comment ces régions ont été choisies ni quels besoins y ont été relevés."
+    )
     raw = RawGrading(
-        grades=(RawGrade("Q1", 2, ("E1.1",), False, {"E1": "Le projet est ciblé."}),),
-        justifications={},
+        grades=(RawGrade("Q1", 2, ("E1.1",), False, "Le projet est ciblé [E1.1]."),),
+        justifications={"C1": unsourced},
     )
     grading = Grading()
 
     interpret(batch, raw, grading)
+    results = finalize(_inputs(criterion), retrieved, grading, RULES)
 
-    reading = grading.grades[question.id].readings[segment]
-    # Le marqueur, ajouté avant la ponctuation, mène à la phrase de la note.
-    assert reading.text == "Le projet est ciblé⟦1⟧."
-    assert [source.spans for source in reading.citations] == [
-        ((0, text.index(" Le comité")),)
-    ]
+    # La note tient ; la phrase de circonstance n'est pas publiée.
+    assert grading.grades[question.id].note == 2
+    assert grading.grades[question.id].interpretation is None
+    # Sans source, la justification cède la place au libellé factuel.
+    (note,) = results.notes
+    assert note.justification == "Moyenne des notes de 1 sous-questions documentées."
+    assert note.written is None
 
 
 def test_the_evaluated_project_goes_with_the_message() -> None:

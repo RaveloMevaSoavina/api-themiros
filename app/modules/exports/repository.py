@@ -20,6 +20,8 @@ VARIABLE_TEXT = (
     "code,label,description,source_locale,"
     "pillar_variable_translations(locale,label,description)"
 )
+# Interprétation en paragraphe, ses traductions et ses sources.
+INTERPRETATION = "interpretation,interpretation_translations,interpretation_citations"
 
 
 class ExportRepository:
@@ -56,6 +58,7 @@ class ExportRepository:
             scores,
             variables,
             notes,
+            answers,
             alerts,
             evidences,
             syntheses,
@@ -67,31 +70,40 @@ class ExportRepository:
             select(
                 "layer_a_scores",
                 "id,pillar_id,score,delta,evolution_label,corpus_confidence,"
-                f"documents_count,pillars({PILLAR_TEXT}),"
+                f"documents_count,{INTERPRETATION},pillars({PILLAR_TEXT}),"
                 "program_versions(label,order_index)",
             ),
             select(
                 "intermediate_variables",
                 "id,pillar_id,variable_code,value,state,documents_count,"
-                "corpus_confidence,program_versions(label,order_index),"
+                f"corpus_confidence,{INTERPRETATION},"
+                "program_versions(label,order_index),"
                 f"pillars(pillar_variables({VARIABLE_TEXT}))",
             ),
             select(
                 "layer_b_notes",
                 "id,criterion_id,note,status,documented_sub_questions,"
-                "total_sub_questions,justification,ambiguity_flag,"
-                "criteria(code,name)",
+                "total_sub_questions,justification,justification_translations,"
+                "citations,ambiguity_flag,criteria(code,name)",
+            ),
+            select(
+                "layer_b_sub_answers",
+                f"id,sub_question_id,status,{INTERPRETATION},"
+                "sub_questions(text,criterion_id,origin,order_index,"
+                "ref_questions(ref_question_translations(locale,text))),"
+                "sub_answer_evidences(evidence_id)",
             ),
             select(
                 "layer_c_alerts",
-                "id,rule_code,alert_type,severity,message,qualified,status,"
+                "id,rule_code,alert_type,severity,message,translations,citations,"
+                "qualified,status,"
                 f"instruction_comment,pillar_id,criterion_id,pillars({PILLAR_TEXT}),"
                 "criteria(name),alert_evidences(evidence_id)",
             ),
             select(
                 "evidences",
                 "id,document_id,page_number,section_title,excerpt,pillar_id,"
-                "criterion_id,variable_code,similarity,"
+                f"criterion_id,variable_code,similarity,{INTERPRETATION},"
                 "documents(original_filename)",
                 order="created_at,id",
             ),
@@ -117,6 +129,7 @@ class ExportRepository:
             scores=scores,
             variables=variables,
             notes=notes,
+            answers=answers,
             alerts=alerts,
             evidences=evidences,
             synthesis=syntheses[0] if syntheses else None,

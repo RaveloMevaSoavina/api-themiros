@@ -33,6 +33,16 @@ SUIVI_SEGMENT = UUID("0a000000-0000-4000-8000-000000000002")
 PERTINENCE_SEGMENT = UUID("0b000000-0000-4000-8000-000000000001")
 IMPACT_SEGMENT = UUID("0b000000-0000-4000-8000-000000000002")
 RULES = RestitutionRules()
+# Suite d'analyse : un constat ou une raison est un paragraphe, pas une
+# phrase de circonstance (plus courts, ils ne sont pas publiés).
+PAD = (
+    " Les documents du projet décrivent ce point en détail, sans préciser "
+    "encore comment il se traduit dans sa mise en œuvre effective."
+)
+EN_PAD = (
+    " The project documents describe this point in great detail, without "
+    "yet stating how it translates into its actual day-to-day implementation."
+)
 
 
 def _inputs(locale: str = "fr") -> LayerCInputs:
@@ -331,7 +341,7 @@ def test_nothing_to_write_means_no_ai_call() -> None:
     assert build_batch("fr", restitution, {}, RULES) is None
 
 
-def _projections(reason: str = "le critère est faiblement étayé"):
+def _projections(reason: str = "le critère est faiblement étayé" + PAD):
     return {
         persona: RawProjection(f"Action ({persona}).", reason)
         for persona in ("decideur", "pmu", "analyste")
@@ -342,16 +352,16 @@ def test_the_ai_writes_items_conclusion_and_actions() -> None:
     restitution, batch, alert = _full_restitution()
     raw = RawRestitution(
         items=(
-            RawItem("P1", "L'exécution budgétaire progresse.", ("E1", "E9")),
+            RawItem("P1", "L'exécution budgétaire progresse [E1]." + PAD, ("E1", "E9")),
             RawItem("W1", "  ", ("E3",)),
-            RawItem("V1", "Écart de pertinence à vérifier.", ("E3",)),
+            RawItem("V1", "Écart de pertinence à vérifier." + PAD, ("E3",)),
         ),
         conclusion="Les résultats suggèrent une exécution mieux documentée.",
         actions=(
             RawAction(
                 "V1",
                 ("E2",),
-                _projections("Recommandée parce que l'écart A/B est majeur"),
+                _projections("Recommandée parce que l'écart A/B est majeur" + PAD),
             ),
             RawAction("W1", ("E3",), _projections()),
             RawAction(
@@ -366,7 +376,7 @@ def test_the_ai_writes_items_conclusion_and_actions() -> None:
     interpret(restitution, batch, raw)
 
     progress = restitution.items("progres")[0]
-    assert progress.text == "L'exécution budgétaire progresse."
+    assert progress.text == "L'exécution budgétaire progresse⟦1⟧." + PAD
     # E9 n'existe pas : seul E1 est retenu.
     assert progress.segment_ids == [BUDGET_SEGMENT]
     weakness = restitution.items("faiblesse")[0]
@@ -384,7 +394,7 @@ def test_the_ai_writes_items_conclusion_and_actions() -> None:
         "pmu",
         "analyste",
     ]
-    assert v1.projections[0].justification == "l'écart A/B est majeur"
+    assert v1.projections[0].justification == "l'écart A/B est majeur" + PAD
     assert v1.segment_ids == [PERTINENCE_SEGMENT]
     assert restitution.qualified is True
 
@@ -422,14 +432,16 @@ def test_the_same_call_asks_for_the_other_interface_languages() -> None:
 def test_translations_follow_what_was_written() -> None:
     restitution, batch, _ = _full_restitution()
     english = {
-        persona: RawProjection(f"Action ({persona}) in English.", "the gap is major")
+        persona: RawProjection(
+            f"Action ({persona}) in English.", "the gap is major" + EN_PAD
+        )
         for persona in ("decideur", "pmu", "analyste")
     }
     raw = RawRestitution(
         items=(
-            RawItem("P1", "L'exécution budgétaire progresse.", ("E1",)),
+            RawItem("P1", "L'exécution budgétaire progresse [E1]." + PAD, ("E1",)),
             RawItem("W1", "  ", ("E3",)),
-            RawItem("V1", "Écart de pertinence à vérifier.", ("E2",)),
+            RawItem("V1", "Écart de pertinence à vérifier [E2]." + PAD, ("E2",)),
         ),
         conclusion="Les résultats suggèrent un progrès.\n\nSous réserve.",
         actions=(
@@ -438,7 +450,10 @@ def test_translations_follow_what_was_written() -> None:
         ),
         translations={
             "en": RawTranslation(
-                items={"P1": "Budget execution improves.", "W1": "Weak relevance."},
+                items={
+                    "P1": "Budget execution improves [E1]." + EN_PAD,
+                    "W1": "Weak relevance." + EN_PAD,
+                },
                 conclusion="Results suggest progress.\n\nSubject to review.",
                 actions={
                     "V1": english,
@@ -454,7 +469,7 @@ def test_translations_follow_what_was_written() -> None:
     interpret(restitution, batch, raw)
 
     progress = restitution.items("progres")[0]
-    assert progress.translations == {"en": "Budget execution improves."}
+    assert progress.translations == {"en": "Budget execution improves⟦1⟧." + EN_PAD}
     # W1 garde son libellé factuel : rien à traduire.
     assert restitution.items("faiblesse")[0].translations == {}
     assert restitution.items("a_verifier")[0].translations == {}
@@ -464,7 +479,10 @@ def test_translations_follow_what_was_written() -> None:
     w1, v1 = restitution.actions
     assert all(projection.translations == {} for projection in w1.projections)
     assert v1.projections[1].translations == {
-        "en": {"text": "Action (pmu) in English.", "justification": "the gap is major"}
+        "en": {
+            "text": "Action (pmu) in English.",
+            "justification": "the gap is major" + EN_PAD,
+        }
     }
 
     payload = restitution.payload()
@@ -472,10 +490,12 @@ def test_translations_follow_what_was_written() -> None:
     assert payload["synthesis"]["translations"] == {
         "en": {"conclusion": "Results suggest progress.\n\nSubject to review."}
     }
-    assert payload["items"][0]["translations"] == {"en": "Budget execution improves."}
+    assert payload["items"][0]["translations"] == {
+        "en": "Budget execution improves⟦1⟧." + EN_PAD
+    }
     assert payload["actions"][1]["projections"][0]["translations"]["en"] == {
         "text": "Action (decideur) in English.",
-        "justification": "the gap is major",
+        "justification": "the gap is major" + EN_PAD,
     }
 
 
@@ -528,13 +548,13 @@ def test_english_labels_follow_the_approach_locale() -> None:
     )
 
 
-def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
+def test_texts_cite_their_sources() -> None:
     restitution, batch, alert = _full_restitution()
     budget = batch.excerpts["E1"]
     raw = RawRestitution(
         items=(
-            RawItem("P1", "L'exécution progresse [E1.2, E3].", ()),
-            RawItem("V1", "Écart à vérifier [E2, E1].", ("E2",)),
+            RawItem("P1", "L'exécution progresse [E1.2, E3]." + PAD, ()),
+            RawItem("V1", "Écart de pertinence à vérifier [E2, E1]." + PAD, ("E2",)),
         ),
         conclusion=(
             "L'exécution atteint 85 % [E1.1, E4].\n\nLe suivi reste manuel [E2, E9]."
@@ -545,22 +565,18 @@ def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
                 (),
                 {
                     persona: RawProjection(
-                        "Vérifier l'écart.", "les besoins ne sont pas analysés [E2]"
+                        "Vérifier l'écart.",
+                        "les besoins ne sont pas analysés [E2]." + PAD,
                     )
                     for persona in ("decideur", "pmu", "analyste")
                 },
             ),
         ),
-        readings={
-            "E1": "Le projet exécute bien son budget [E1.1, E2].",
-            "E9": "?",
-        },
         translations={
             "en": RawTranslation(
-                items={"P1": "Execution improves [E1.2]."},
+                items={"P1": "Execution improves [E1.2]." + EN_PAD},
                 conclusion="Execution reaches 85% [E4, E1.1].\n\nMonitoring [E2].",
                 actions={},
-                readings={"E1": "The project executes its budget well [E1.1]."},
             )
         },
     )
@@ -569,11 +585,11 @@ def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
 
     progress = restitution.items("progres")[0]
     # E3 n'est pas proposé pour ce constat : seule E1.2 est sa source.
-    assert progress.text == "L'exécution progresse⟦1⟧."
-    assert progress.translations == {"en": "Execution improves⟦1⟧."}
+    assert progress.text == "L'exécution progresse⟦1⟧." + PAD
+    assert progress.translations == {"en": "Execution improves⟦1⟧." + EN_PAD}
     assert progress.citations == [Source(BUDGET_SEGMENT, (budget.spans[1],))]
     to_verify = restitution.items("a_verifier")[0]
-    assert to_verify.text == "Écart à vérifier⟦1,2⟧."
+    assert to_verify.text == "Écart de pertinence à vérifier⟦1,2⟧." + PAD
     assert to_verify.segment_ids == [PERTINENCE_SEGMENT, BUDGET_SEGMENT]
     # Paragraphes gardés ; mêmes numéros dans la traduction.
     assert restitution.conclusion == (
@@ -588,15 +604,10 @@ def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
         PERTINENCE_SEGMENT,
     ]
     (action,) = restitution.actions
-    assert action.projections[0].justification == "les besoins ne sont pas analysés⟦1⟧"
+    assert action.projections[0].justification == (
+        "les besoins ne sont pas analysés⟦1⟧." + PAD
+    )
     assert action.segment_ids == [PERTINENCE_SEGMENT]
-    reading = restitution.readings[BUDGET_SEGMENT]
-    # Ses sources : ses propres phrases seulement (E2 disparaît).
-    assert reading.text == "Le projet exécute bien son budget⟦1⟧."
-    assert reading.translations == {"en": "The project executes its budget well⟦1⟧."}
-    assert reading.citations == [Source(BUDGET_SEGMENT, (budget.spans[0],))]
-    # Phrases citées de l'extrait par tous les textes : V1 le cite entier.
-    assert reading.spans == ((budget.spans[0][0], budget.spans[-1][1]),)
 
     payload = restitution.payload()
     assert payload["items"][0]["citations"] == [
@@ -609,14 +620,21 @@ def test_texts_cite_their_sources_and_extracts_are_interpreted() -> None:
             "spans": [list(batch.excerpts["E2"].spans[0])],
         }
     ]
-    assert payload["readings"] == [
-        {
-            "segment_id": str(BUDGET_SEGMENT),
-            "interpretation": "Le projet exécute bien son budget⟦1⟧.",
-            "translations": {"en": "The project executes its budget well⟦1⟧."},
-            "interpretation_citations": [
-                {"segment_id": str(BUDGET_SEGMENT), "spans": [list(budget.spans[0])]}
-            ],
-            "spans": [[budget.spans[0][0], budget.spans[-1][1]]],
-        }
-    ]
+    # Les extraits sont lus par l'étape de lecture, plus par la restitution.
+    assert "readings" not in payload
+
+
+def test_a_short_item_keeps_its_label_and_a_short_reason_drops_the_action() -> None:
+    restitution, batch, _ = _full_restitution()
+    raw = RawRestitution(
+        items=(RawItem("P1", "L'exécution progresse [E1].", ("E1",)),),
+        conclusion="Les résultats suggèrent un progrès.",
+        actions=(RawAction("W1", ("E3",), _projections("faible [E3]")),),
+    )
+
+    interpret(restitution, batch, raw)
+
+    assert restitution.items("progres")[0].text == (
+        "Budget et absorption : 85/100, +22 points depuis la version précédente."
+    )
+    assert restitution.actions == []

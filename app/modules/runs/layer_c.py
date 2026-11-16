@@ -20,10 +20,13 @@ Déroulé, pour un run :
    detect_incoherence), extraits dédoublonnés et tronqués, identifiants
    courts (A1, E1). Plusieurs appels seulement au-delà du plafond ;
 3. `interpret` : l'IA confirme ou infirme chaque écart, fixe sa gravité et
-   rédige son message en citant des extraits proposés pour lui. Un écart
-   infirmé n'est pas publié. Le projet évalué (`pj`) accompagne le
-   message : l'IA dit ce qu'il faut vérifier dans le projet, pas l'écart
-   entre un score et une note.
+   rédige son message, un paragraphe qui explique l'écart et dit ce qu'il
+   faut vérifier, en citant dans le texte les phrases des extraits proposés
+   pour lui (`citations`), traduit dans les autres langues de l'interface
+   par le même appel (`tr`). Un écart infirmé n'est pas publié ; un message
+   trop court ou sans source garde le libellé de sa règle. Le projet évalué
+   (`pj`) accompagne le message : l'IA dit ce qu'il faut vérifier dans le
+   projet, pas l'écart entre un score et une note.
 
 Sans IA (désactivée, en erreur, plafond de coût), les écarts détectés sont
 publiés avec leur gravité par défaut et le libellé de leur règle, marqués
@@ -39,23 +42,38 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from app.modules.frameworks.schemas import INTERFACE_LOCALES
+from app.modules.runs.citations import (
+    Excerpt,
+    Source,
+    cited,
+    excerpt,
+    references,
+    written,
+)
 from app.modules.runs.domain import LayerAResults, PillarScore
 from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.project import ProjectContext
 
-LAYER_C_VERSION = "layer-c/1.1.0"
+LAYER_C_VERSION = "layer-c/1.2.0"
 PROMPT_CODE = "detect_incoherence"
-# v1.1 : le projet évalué (`pj`), sujet des messages.
-PROMPT_VERSION = "v1.1"
+# v1.1 : le projet évalué (`pj`), sujet des messages. v1.2 : message en
+# paragraphe, extraits en phrases citées, traductions (`tr`).
+PROMPT_VERSION = "v1.2"
 
 Severity = Literal["mineure", "majeure"]
 
 # Mêmes estimations que la couche B (~3 caractères par token).
 CHARS_PER_TOKEN = 3
-SYSTEM_PROMPT_TOKENS = 800
-OUTPUT_TOKENS_PER_ALERT = 90
-MESSAGE_CHARS = 200
-STORED_MESSAGE_CHARS = 300
+SYSTEM_PROMPT_TOKENS = 1200
+# Qualification et message (un paragraphe), par langue.
+OUTPUT_TOKENS_PER_ALERT = 320
+# Le prompt (v1.2) demande 350 à 800 caractères hors sources : ce plafond ne
+# coupe qu'un dépassement net ; sous le minimum, le libellé de la règle reste.
+MESSAGE_CHARS = 900
+MESSAGE_MIN_CHARS = 150
+# Plafond de la base, marqueurs compris.
+STORED_MESSAGE_CHARS = 1500
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +89,7 @@ class LayerCRules:
     evidences_per_alert: int = 4
     excerpt_chars: int = 500
     max_input_tokens: int = 30000
-    max_output_tokens: int = 2000
+    max_output_tokens: int = 8000
 
     def as_dict(self) -> dict[str, Any]:
         return {"engine_version": LAYER_C_VERSION, **asdict(self)}
@@ -155,6 +173,10 @@ class Alert:
     segment_ids: list[UUID]
     message: str
     qualified: bool = False
+    # Message traduit, par langue de l'interface (autre que celle du run).
+    translations: dict[str, str] = field(default_factory=dict)
+    # Sources numérotées du message et de ses traductions (« ⟦1⟧ »).
+    citations: list[Source] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +188,8 @@ class RawQualification:
     severity: str
     message: str
     excerpts: tuple[str, ...]
+    # Langue -> message traduit.
+    translations: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -177,8 +201,11 @@ class QualificationBatch:
     content: dict[str, Any] = field(default_factory=dict)
     alert_keys: dict[str, UUID] = field(default_factory=dict)
     excerpt_keys: dict[str, UUID] = field(default_factory=dict)
+    excerpts: dict[str, Excerpt] = field(default_factory=dict)
     # Extraits proposés pour chaque écart : seuls citables (GF-1).
     allowed: dict[UUID, frozenset[str]] = field(default_factory=dict)
+    # Langues de traduction demandées (`tr`), hors langue de rédaction.
+    locales: tuple[str, ...] = ()
     estimated_input_tokens: int = 0
     max_output_tokens: int = 0
 
@@ -218,6 +245,8 @@ class LayerCResults:
                     "alert_type": alert.rule.alert_type,
                     "severity": alert.severity,
                     "message": alert.message,
+                    "translations": alert.translations,
+                    "citations": [source.as_dict() for source in alert.citations],
                     "qualified": alert.qualified,
                     "segment_ids": [str(segment) for segment in alert.segment_ids],
                 }
@@ -436,10 +465,10 @@ def _entry(
     alert: Alert,
     texts: Mapping[UUID, str],
     rules: LayerCRules,
-) -> tuple[dict[str, Any], dict[str, tuple[UUID, str]]]:
-    """Entrée d'un écart et extraits nouveaux pour le lot."""
+) -> tuple[dict[str, Any], dict[str, Excerpt]]:
+    """Entrée d'un écart et extraits nouveaux pour le lot, en phrases."""
     key_of_segment = {segment: k for k, segment in batch.excerpt_keys.items()}
-    added: dict[str, tuple[UUID, str]] = {}
+    added: dict[str, Excerpt] = {}
     keys: list[str] = []
     for segment_id in alert.segment_ids:
         if segment_id not in texts:
@@ -448,9 +477,8 @@ def _entry(
         if excerpt_key is None:
             excerpt_key = f"E{len(batch.excerpt_keys) + len(added) + 1}"
             key_of_segment[segment_id] = excerpt_key
-            added[excerpt_key] = (
-                segment_id,
-                truncate(texts[segment_id], rules.excerpt_chars),
+            added[excerpt_key] = excerpt(
+                segment_id, texts[segment_id], rules.excerpt_chars
             )
         keys.append(excerpt_key)
     entry: dict[str, Any] = {
@@ -476,20 +504,23 @@ def _add(
     batch: QualificationBatch,
     alert: Alert,
     entry: dict[str, Any],
-    added: Mapping[str, tuple[UUID, str]],
+    added: Mapping[str, Excerpt],
 ) -> None:
     batch.alerts.append(alert)
     batch.alert_keys[entry["k"]] = alert.id
     excerpts = batch.content.setdefault("x", {})
-    for key, (segment_id, text) in added.items():
-        batch.excerpt_keys[key] = segment_id
-        excerpts[key] = text
+    for key, item in added.items():
+        batch.excerpt_keys[key] = item.segment_id
+        batch.excerpts[key] = item
+        excerpts[key] = list(item.sentences)
     batch.allowed[alert.id] = frozenset(entry["e"])
     batch.content.setdefault("a", []).append(entry)
     batch.estimated_input_tokens = SYSTEM_PROMPT_TOKENS + (
         len(batch.message()) // CHARS_PER_TOKEN
     )
-    batch.max_output_tokens = OUTPUT_TOKENS_PER_ALERT * len(batch.alerts)
+    batch.max_output_tokens = (
+        (1 + len(batch.locales)) * OUTPUT_TOKENS_PER_ALERT * len(batch.alerts)
+    )
 
 
 def build_batches(
@@ -501,24 +532,34 @@ def build_batches(
     """Lots d'appels IA : un seul en pratique. Un lot est fermé quand
     l'écart suivant ferait dépasser le plafond d'entrée ou de sortie."""
     batches: list[QualificationBatch] = []
+    locales = tuple(other for other in INTERFACE_LOCALES if other != inputs.locale)
     header: dict[str, Any] = {"lang": inputs.locale}
     if project := inputs.project.prompt():
         header["pj"] = project
-    current = QualificationBatch(content=dict(header))
+    if locales:
+        header["tr"] = list(locales)
+
+    def new_batch() -> QualificationBatch:
+        return QualificationBatch(content=dict(header), locales=locales)
+
+    current = new_batch()
     for alert in alerts:
         key = f"A{len(current.alerts) + 1}"
         entry, added = _entry(current, key, alert, texts, rules)
         growth = len(
             json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
-        ) + sum(len(text) + len(key) + 6 for key, (_, text) in added.items())
+        ) + sum(
+            len(json.dumps(list(item.sentences), ensure_ascii=False)) + len(key) + 3
+            for key, item in added.items()
+        )
         if current.alerts and (
             current.estimated_input_tokens + growth // CHARS_PER_TOKEN
             > rules.max_input_tokens
-            or current.max_output_tokens + OUTPUT_TOKENS_PER_ALERT
+            or current.max_output_tokens + (1 + len(locales)) * OUTPUT_TOKENS_PER_ALERT
             > rules.max_output_tokens
         ):
             batches.append(current)
-            current = QualificationBatch(content=dict(header))
+            current = new_batch()
             entry, added = _entry(current, "A1", alert, texts, rules)
         _add(current, alert, entry, added)
     if current.alerts:
@@ -534,7 +575,8 @@ def interpret(
     """Applique une réponse IA aux écarts du lot ; renvoie les écarts
     infirmés. Gravité hors liste : celle par défaut. Corpus pauvre : mineure,
     quoi que dise l'IA (RG-2). Extraits cités hors de ceux proposés pour
-    l'écart : ignorés ; sans extrait valable, l'écart garde ses preuves."""
+    l'écart : ignorés ; sans extrait valable, l'écart garde ses preuves.
+    Message trop court ou sans source : le libellé de la règle reste."""
     by_id = {alert.id: alert for alert in batch.alerts}
     seen: set[UUID] = set()
     infirmed: set[UUID] = set()
@@ -551,14 +593,24 @@ def interpret(
             alert.severity = item.severity  # type: ignore[assignment]
         if alert.confidence < rules.poor_confidence:
             alert.severity = "mineure"
-        if item.message and item.message.strip():
-            alert.message = truncate(item.message, MESSAGE_CHARS)
-        cited = [
-            batch.excerpt_keys[key]
-            for key in dict.fromkeys(item.excerpts)
-            if key in batch.allowed.get(alert_id, ())
-        ]
-        if cited:
-            alert.segment_ids = cited
+        allowed = batch.allowed.get(alert_id, frozenset())
+        message = written(
+            item.message,
+            {locale: item.translations.get(locale) for locale in batch.locales},
+            batch.excerpts,
+            allowed,
+            MESSAGE_CHARS,
+            STORED_MESSAGE_CHARS,
+            MESSAGE_MIN_CHARS,
+        )
+        if message is not None:
+            alert.message = message.text
+            alert.translations = message.translations
+            alert.citations = message.citations
+        found = cited(
+            [*item.excerpts, *references(item.message)], batch.excerpts, allowed
+        )
+        if found:
+            alert.segment_ids = [batch.excerpt_keys[key] for key in found]
         alert.qualified = True
     return infirmed

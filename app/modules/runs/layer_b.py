@@ -13,11 +13,14 @@ Déroulé, pour un run :
 3. `interpret` : une sous-question n'est documentée que si l'IA lui donne une
    note en citant au moins un de ses propres extraits (GF-1, RG-4). L'IA
    cite des phrases (E1.2) : la preuve garde leurs positions, que le
-   surlignage reprend, et une phrase d'interprétation de l'extrait : ce
-   qu'il établit sur le projet, avec ses propres phrases pour sources
-   (`Reading`). La justification du critère cite ses sources dans le texte
-   (`citations`). Le projet évalué (`pj`) accompagne le message : les
-   textes parlent de lui, pas des critères ni des notes ;
+   surlignage reprend. Chaque sous-question reçoit un paragraphe qui
+   interprète sa réponse, chaque critère une justification argumentée ;
+   tous deux citent leurs sources dans le texte et sont traduits dans les
+   autres langues de l'interface par le même appel (`tr`). Un texte trop
+   court ou sans source n'est pas publié. Les extraits eux-mêmes sont lus
+   par l'étape de lecture (`reading`), une fois par run. Le projet évalué
+   (`pj`) accompagne le message : les textes parlent de lui, pas des
+   critères ni des notes ;
 4. `finalize` : note du critère = moyenne des notes des sous-questions
    documentées, si au moins 50 % le sont ; ambiguïté si les extraits se
    contredisent ou si les notes sont dispersées (RG-3).
@@ -37,27 +40,26 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from app.modules.evidences.passages import Span, merge
+from app.modules.frameworks.schemas import INTERFACE_LOCALES
 from app.modules.runs.citations import (
-    Citations,
     Excerpt,
     Reading,
-    Source,
     cited,
-    compact,
     excerpt,
-    fit,
-    read,
+    reading_payload,
+    written,
 )
-from app.modules.runs.citations import truncate as truncate_cited
 from app.modules.runs.project import ProjectContext
 
-LAYER_B_VERSION = "layer-b/1.2.0"
+LAYER_B_VERSION = "layer-b/1.3.0"
 PROMPT_CODE = "grade_sub_questions"
 # v1.1 : extraits en phrases, phrases citées, interprétation de chaque
 # extrait cité, sources dans la justification. v1.2 : le projet évalué
 # (`pj`), sujet des justifications et des interprétations, qui citent
-# leurs phrases.
-PROMPT_VERSION = "v1.2"
+# leurs phrases. v1.3 : interprétation en paragraphe de chaque
+# sous-question, justification argumentée, traductions (`tr`) ; les
+# extraits sont lus par l'étape de lecture.
+PROMPT_VERSION = "v1.3"
 
 NoteStatus = Literal["conclu", "non_conclu"]
 AnswerStatus = Literal["documentee", "non_documentee"]
@@ -65,19 +67,24 @@ AnswerStatus = Literal["documentee", "non_documentee"]
 # Tokens estimés : ~3 caractères par token pour du français en JSON compact
 # (estimation prudente), plus le prompt système.
 CHARS_PER_TOKEN = 3
-SYSTEM_PROMPT_TOKENS = 950
-# Note, extraits cités et leur interprétation (une phrase chacun).
-OUTPUT_TOKENS_PER_QUESTION = 120
-OUTPUT_TOKENS_PER_CRITERION = 150
+SYSTEM_PROMPT_TOKENS = 1500
+# Note, extraits cités et interprétation (un paragraphe), par langue.
+OUTPUT_TOKENS_PER_QUESTION = 260
+# Justification (un paragraphe argumenté), par langue.
+OUTPUT_TOKENS_PER_CRITERION = 480
 DEFINITION_CHARS = 200
 EXPECTED_EVIDENCE_CHARS = 160
-JUSTIFICATION_CHARS = 600
-# Plafond de la base pour une justification, marqueurs compris.
-JUSTIFICATION_MAX_CHARS = 1000
-# Le prompt (v1.2) demande 160 caractères hors sources.
-READING_CHARS = 220
-# Plafond de la base pour une interprétation, marqueurs compris.
-READING_MAX_CHARS = 400
+# Le prompt (v1.3) demande 500 à 1 200 caractères hors sources pour une
+# justification, 300 à 600 pour l'interprétation d'une sous-question : ces
+# plafonds ne coupent qu'un dépassement net ; sous les minimums, une phrase
+# de circonstance n'est pas publiée.
+JUSTIFICATION_CHARS = 1400
+JUSTIFICATION_MIN_CHARS = 200
+INTERPRETATION_CHARS = 800
+INTERPRETATION_MIN_CHARS = 120
+# Plafonds de la base, marqueurs compris.
+JUSTIFICATION_MAX_CHARS = 2000
+INTERPRETATION_MAX_CHARS = 1500
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +94,7 @@ class LayerBRules:
     excerpts_per_question: int = 3
     excerpt_chars: int = 600
     max_input_tokens: int = 30000
-    max_output_tokens: int = 12000
+    max_output_tokens: int = 16000
     documented_ratio: float = 0.5
     ambiguity_std: float = 1.0
 
@@ -180,9 +187,10 @@ class Grade:
     note: int
     segment_ids: tuple[UUID, ...]
     contradictory: bool
-    # Par segment cité : positions des phrases citées, interprétation.
+    # Par segment cité : positions des phrases citées.
     spans: Mapping[UUID, tuple[Span, ...]] = field(default_factory=dict)
-    readings: Mapping[UUID, Reading] = field(default_factory=dict)
+    # Interprétation de la réponse, sourcée et traduite.
+    interpretation: Reading | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,14 +201,24 @@ class RawGrade:
     note: int | None
     excerpts: tuple[str, ...]
     contradictory: bool
-    # Identifiant d'extrait -> interprétation pour la sous-question.
-    readings: Mapping[str, str] = field(default_factory=dict)
+    # Interprétation de la réponse (un paragraphe).
+    interpretation: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RawGradingTranslation:
+    """Traduction de la réponse dans une langue, par identifiant court."""
+
+    interpretations: Mapping[str, str] = field(default_factory=dict)
+    justifications: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class RawGrading:
     grades: tuple[RawGrade, ...]
     justifications: Mapping[str, str]
+    # Langue -> traduction ; seules les langues demandées (`tr`) comptent.
+    translations: Mapping[str, RawGradingTranslation] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -219,6 +237,8 @@ class GradingBatch:
     # Extraits citables par la justification d'un critère : ceux de ses
     # sous-questions.
     criterion_allowed: dict[UUID, frozenset[str]] = field(default_factory=dict)
+    # Langues de traduction demandées (`tr`), hors langue de rédaction.
+    locales: tuple[str, ...] = ()
     estimated_input_tokens: int = 0
     max_output_tokens: int = 0
 
@@ -232,8 +252,8 @@ class Grading:
 
     graded_criteria: set[UUID] = field(default_factory=set)
     grades: dict[UUID, Grade] = field(default_factory=dict)
-    justifications: dict[UUID, str] = field(default_factory=dict)
-    citations: dict[UUID, list[Source]] = field(default_factory=dict)
+    # Justification sourcée et traduite de chaque critère.
+    justifications: dict[UUID, Reading] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -246,9 +266,9 @@ class SubAnswerResult:
     evidences: list[Candidate]
     # Critère de la sous-question : la couche C y rattache ses preuves.
     criterion_id: UUID | None = None
-    # Par segment cité : positions des phrases citées, interprétation.
+    # Par segment cité : positions des phrases citées.
     spans: Mapping[UUID, tuple[Span, ...]] = field(default_factory=dict)
-    readings: Mapping[UUID, Reading] = field(default_factory=dict)
+    interpretation: Reading | None = None
 
 
 @dataclass(slots=True)
@@ -260,8 +280,9 @@ class CriterionNote:
     total: int
     justification: str
     ambiguous: bool
-    # Sources numérotées de la justification (« ⟦1⟧ »).
-    citations: list[Source] = field(default_factory=list)
+    # Justification rédigée par l'IA : sources numérotées (« ⟦1⟧ ») et
+    # traductions ; `None` pour un libellé factuel.
+    written: Reading | None = None
 
 
 @dataclass(slots=True)
@@ -293,7 +314,13 @@ class LayerBResults:
                     "total_sub_questions": note.total,
                     "justification": note.justification,
                     "ambiguity_flag": note.ambiguous,
-                    "citations": [source.as_dict() for source in note.citations],
+                    "justification_translations": (
+                        note.written.translations if note.written else {}
+                    ),
+                    "citations": [
+                        source.as_dict()
+                        for source in (note.written.citations if note.written else [])
+                    ],
                 }
                 for note in self.notes
             ],
@@ -304,15 +331,17 @@ class LayerBResults:
                     "status": answer.status,
                     "note": answer.note,
                     "contradictory": answer.contradictory,
+                    **reading_payload(answer.interpretation),
                 }
                 for answer in self.answers
             ],
+            # La lecture de chaque extrait vient de l'étape de lecture
+            # (`readings`), commune à toutes les couches.
             "evidences": [
                 {
                     "sub_answer_id": str(answer.id),
                     "segment_id": str(candidate.segment_id),
                     "similarity": candidate.similarity,
-                    **_reading(answer.readings.get(candidate.segment_id)),
                     "spans": (
                         [list(span) for span in answer.spans[candidate.segment_id]]
                         if answer.spans.get(candidate.segment_id)
@@ -323,16 +352,6 @@ class LayerBResults:
                 for candidate in answer.evidences
             ],
         }
-
-
-def _reading(reading: Reading | None) -> dict[str, Any]:
-    """Interprétation d'une preuve et ses sources (ses propres phrases)."""
-    if reading is None:
-        return {"interpretation": None, "interpretation_citations": []}
-    return {
-        "interpretation": reading.text,
-        "interpretation_citations": [source.as_dict() for source in reading.citations],
-    }
 
 
 def retrieve(
@@ -424,6 +443,7 @@ def _with_criterion(
     allowed = dict(batch.allowed)
     criterion_keys = dict(batch.criterion_keys)
     criterion_allowed = dict(batch.criterion_allowed)
+    locales = tuple(other for other in INTERFACE_LOCALES if other != inputs.locale)
 
     criterion_key = f"C{len(criterion_keys) + 1}"
     criterion_keys[criterion_key] = criterion.id
@@ -463,6 +483,8 @@ def _with_criterion(
     content: dict[str, Any] = {"lang": inputs.locale, "cycle": inputs.cycle}
     if project := inputs.project.prompt():
         content["pj"] = project
+    if locales:
+        content["tr"] = list(locales)
     content |= {
         "x": excerpts,
         "c": [*batch.content.get("c", []), entry],
@@ -476,13 +498,16 @@ def _with_criterion(
         excerpts=excerpt_items,
         allowed=allowed,
         criterion_allowed=criterion_allowed,
+        locales=locales,
     )
     extended.estimated_input_tokens = SYSTEM_PROMPT_TOKENS + (
         len(extended.message()) // CHARS_PER_TOKEN
     )
-    extended.max_output_tokens = OUTPUT_TOKENS_PER_QUESTION * len(
-        question_keys
-    ) + OUTPUT_TOKENS_PER_CRITERION * len(criterion_keys)
+    # Chaque traduction réécrit interprétations et justifications.
+    extended.max_output_tokens = (1 + len(locales)) * (
+        OUTPUT_TOKENS_PER_QUESTION * len(question_keys)
+        + OUTPUT_TOKENS_PER_CRITERION * len(criterion_keys)
+    )
     return extended
 
 
@@ -490,36 +515,37 @@ def interpret(batch: GradingBatch, raw: RawGrading, grading: Grading) -> None:
     """Ajoute à `grading` les notes valides d'une réponse IA. Une note hors
     barème, sans extrait cité, ou citant un extrait qui n'était pas proposé
     pour la question, n'est pas retenue : la question reste non documentée.
-    Une interprétation ne vaut que pour un extrait cité par la note."""
+    L'interprétation d'une sous-question cite ses propres extraits, celle
+    d'un critère les extraits de ses sous-questions ; trop courte ou sans
+    source, elle n'est pas publiée."""
     grading.graded_criteria.update(criterion.id for criterion in batch.criteria)
+    translations = {
+        locale: raw.translations[locale]
+        for locale in batch.locales
+        if locale in raw.translations
+    }
     for raw_grade in raw.grades:
         question_id = batch.question_keys.get(raw_grade.key)
         if question_id is None or question_id in grading.grades:
             continue
         if raw_grade.note is None or raw_grade.note not in (0, 1, 2, 3):
             continue
-        found = cited(
-            raw_grade.excerpts, batch.excerpts, batch.allowed.get(question_id, ())
-        )
+        allowed = batch.allowed.get(question_id, frozenset())
+        found = cited(raw_grade.excerpts, batch.excerpts, allowed)
         if not found:
             continue
-        readings: dict[UUID, Reading] = {}
-        for reference, text in raw_grade.readings.items():
-            key = next(iter(cited([reference], batch.excerpts)), None)
-            if key not in found or batch.excerpt_keys[key] in readings:
-                continue
-            reading = read(
-                key,
-                text,
-                {},
-                batch.excerpts,
-                READING_CHARS,
-                READING_MAX_CHARS,
-                fallback=found[key],
-            )
-            if reading is not None:
-                reading.spans = tuple(merge(found[key]))
-                readings[batch.excerpt_keys[key]] = reading
+        interpretation = written(
+            raw_grade.interpretation,
+            {
+                locale: translation.interpretations.get(raw_grade.key)
+                for locale, translation in translations.items()
+            },
+            batch.excerpts,
+            allowed,
+            INTERPRETATION_CHARS,
+            INTERPRETATION_MAX_CHARS,
+            INTERPRETATION_MIN_CHARS,
+        )
         grading.grades[question_id] = Grade(
             raw_grade.note,
             tuple(batch.excerpt_keys[key] for key in found),
@@ -528,21 +554,26 @@ def interpret(batch: GradingBatch, raw: RawGrading, grading: Grading) -> None:
                 batch.excerpt_keys[key]: tuple(merge(spans))
                 for key, spans in found.items()
             },
-            readings=readings,
+            interpretation=interpretation,
         )
     for key, text in raw.justifications.items():
         criterion_id = batch.criterion_keys.get(key)
-        if criterion_id is None or not text or not text.strip():
+        if criterion_id is None or criterion_id in grading.justifications:
             continue
-        citations = Citations(batch.excerpts)
-        written = citations.cite(text, batch.criterion_allowed.get(criterion_id, ()))
-        (written,), sources = compact(
-            [truncate_cited(written, JUSTIFICATION_CHARS)], citations.sources
+        justification_text = written(
+            text,
+            {
+                locale: translation.justifications.get(key)
+                for locale, translation in translations.items()
+            },
+            batch.excerpts,
+            batch.criterion_allowed.get(criterion_id, ()),
+            JUSTIFICATION_CHARS,
+            JUSTIFICATION_MAX_CHARS,
+            JUSTIFICATION_MIN_CHARS,
         )
-        grading.justifications[criterion_id] = fit(
-            written or "", JUSTIFICATION_MAX_CHARS
-        )
-        grading.citations[criterion_id] = sources
+        if justification_text is not None:
+            grading.justifications[criterion_id] = justification_text
 
 
 JUSTIFICATIONS = {
@@ -624,7 +655,7 @@ def finalize(
                     evidences=evidences,
                     criterion_id=criterion.id,
                     spans=grade.spans if grade else {},
-                    readings=grade.readings if grade else {},
+                    interpretation=grade.interpretation if grade else None,
                 )
             )
 
@@ -652,6 +683,7 @@ def finalize(
                 )
             )
             continue
+        written_justification = grading.justifications.get(criterion.id)
         notes.append(
             CriterionNote(
                 criterion_id=criterion.id,
@@ -659,12 +691,11 @@ def finalize(
                 status="conclu",
                 documented=documented,
                 total=total,
-                justification=grading.justifications.get(criterion.id)
-                or justification(inputs.locale, reason, documented, total),
+                justification=written_justification.text
+                if written_justification
+                else justification(inputs.locale, reason, documented, total),
                 ambiguous=is_ambiguous(grades, rules.ambiguity_std),
-                citations=grading.citations.get(criterion.id, [])
-                if criterion.id in grading.justifications
-                else [],
+                written=written_justification,
             )
         )
     return LayerBResults(notes=notes, answers=answers)

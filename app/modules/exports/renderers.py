@@ -22,17 +22,43 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from app.modules.exports.report import Note, PillarScore, Report
+from app.modules.exports.report import (
+    Note,
+    PillarResult,
+    PillarScore,
+    Report,
+    VariableLine,
+)
 
 WARNING = "B42318"
 MUTED = "667085"
 
 
 def paragraphs(text: str | None) -> list[str]:
-    """Conclusion narrative : un paragraphe par bloc (prompt v1.1)."""
+    """Texte narratif (conclusion, interprétations, justifications) : un
+    paragraphe par bloc, entier."""
     return [
         block.strip() for block in re.split(r"\n\s*\n", text or "") if block.strip()
     ]
+
+
+def readings(report: Report, pillar: PillarResult) -> list[tuple[str | None, str]]:
+    """Interprétations du pilier : la version en titre si le run en compte
+    plusieurs, sinon celle de la dernière version seule."""
+    if report.multiple_versions:
+        return [
+            (score.version, score.interpretation)
+            for score in pillar.scores
+            if score.interpretation
+        ]
+    latest = pillar.latest.interpretation
+    return [(None, latest)] if latest else []
+
+
+def variable_name(report: Report, variable: VariableLine) -> str:
+    if report.multiple_versions:
+        return f"{variable.label} ({variable.version})"
+    return variable.label
 
 
 def filename(report: Report, extension: str) -> str:
@@ -81,6 +107,13 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 def _refs(report: Report, numbers: list[int]) -> str:
     label = report.labels["columns"]["notes"]
     return f"<p class='refs'>{_e(label)} {_e(report.refs(numbers))}</p>"
+
+
+def _paragraphs(text: str | None, empty: str | None = None) -> str:
+    blocks = paragraphs(text)
+    if not blocks:
+        return f"<p>{_e(empty)}</p>" if empty else ""
+    return "".join(f"<p>{_e(block)}</p>" for block in blocks)
 
 
 def _origin(report: Report, origin: str, numbers: list[int]) -> str:
@@ -154,6 +187,10 @@ def _html(report: Report) -> str:
                 ]
             )
             html.append(f"<p>{_e(summary)}</p>")
+        for version, text in readings(report, pillar):
+            title = c["interpretation"] + (f" · {version}" if version else "")
+            html.append(f"<p class='muted'><b>{_e(title)}</b></p>")
+            html.append(_paragraphs(text))
         if pillar.variables:
             headers = [c["variable"]]
             if report.multiple_versions:
@@ -172,6 +209,11 @@ def _html(report: Report) -> str:
                 ]
                 rows.append(row)
             html.append(_table(headers, rows))
+            for variable in pillar.variables:
+                if variable.interpretation:
+                    name = variable_name(report, variable)
+                    html.append(f"<p class='muted'><b>{_e(name)}</b></p>")
+                    html.append(_paragraphs(variable.interpretation))
         else:
             html.append(f"<p>{_e(t['no_variables'])}</p>")
         if pillar.notes:
@@ -205,9 +247,29 @@ def _html(report: Report) -> str:
         )
         for criterion in report.criteria:
             html.append(f"<h3>{_e(criterion.code)} · {_e(criterion.name)}</h3>")
-            html.append(f"<p>{_e(criterion.justification or t['empty'])}</p>")
+            html.append(_paragraphs(criterion.justification, t["empty"]))
             if criterion.notes:
                 html.append(_refs(report, criterion.notes))
+            if criterion.answers:
+                html.append(f"<p class='muted'><b>{_e(c['sub_questions'])}</b></p>")
+                html.append("<ul>")
+                for answer in criterion.answers:
+                    status = t["answer_status"].get(answer.status, answer.status)
+                    blocks = "".join(
+                        f"<br/>{_e(block)}"
+                        for block in paragraphs(answer.interpretation)
+                    )
+                    numbers = _e(report.refs(answer.notes))
+                    refs = (
+                        f"<br/><span class='refs'>{numbers}</span>"
+                        if answer.notes
+                        else ""
+                    )
+                    html.append(
+                        f"<li><b>{_e(answer.question)}</b> · {_e(status)}"
+                        f"{blocks}{refs}</li>"
+                    )
+                html.append("</ul>")
     else:
         html.append(f"<p>{_e(t['no_criteria'])}</p>")
 
@@ -218,7 +280,7 @@ def _html(report: Report) -> str:
     for alert in report.alerts:
         severity = t["severity"].get(alert.severity, alert.severity)
         html.append(f"<h3>{_e(f'{severity} · {alert.rule} · {alert.scope}')}</h3>")
-        html.append(f"<p>{_e(alert.message)}</p>")
+        html.append(_paragraphs(alert.message))
         details = " · ".join(
             [
                 report.labeled(
@@ -281,6 +343,11 @@ def _html(report: Report) -> str:
         lines = [
             f"<b>[{note.number}]</b> {_e(_source(report, note))}",
             f"<span class='muted'>{_e(note.subject)}</span>",
+            *(
+                _e(block)
+                for reading in note.interpretations
+                for block in paragraphs(reading)
+            ),
             *(_e(report.quote(excerpt)) for excerpt in note.excerpts),
         ]
         omitted = report.omitted(note)
@@ -481,6 +548,11 @@ def render_docx(report: Report) -> bytes:
             [c["version"], *score_headers],
             [[s.version, *_score_cells(report, s)] for s in pillar.scores],
         )
+        for version, text in readings(report, pillar):
+            title = c["interpretation"] + (f" · {version}" if version else "")
+            document.add_paragraph().add_run(title).bold = True
+            for block in paragraphs(text):
+                document.add_paragraph(block)
         if pillar.variables:
             headers = [c["variable"]]
             if report.multiple_versions:
@@ -499,6 +571,12 @@ def render_docx(report: Report) -> bytes:
                 ]
                 rows.append(row)
             _docx_table(document, headers, rows)
+            for variable in pillar.variables:
+                if variable.interpretation:
+                    name = variable_name(report, variable)
+                    document.add_paragraph().add_run(name).bold = True
+                    for block in paragraphs(variable.interpretation):
+                        document.add_paragraph(block)
         else:
             document.add_paragraph(t["no_variables"])
         if pillar.notes:
@@ -531,9 +609,19 @@ def render_docx(report: Report) -> bytes:
         )
         for criterion in report.criteria:
             document.add_heading(f"{criterion.code} · {criterion.name}", 3)
-            document.add_paragraph(criterion.justification or t["empty"])
+            for block in paragraphs(criterion.justification) or [t["empty"]]:
+                document.add_paragraph(block)
             if criterion.notes:
                 _muted(document, f"{c['notes']} {report.refs(criterion.notes)}")
+            for answer in criterion.answers:
+                status = t["answer_status"].get(answer.status, answer.status)
+                paragraph = document.add_paragraph(style="List Bullet")
+                paragraph.add_run(answer.question).bold = True
+                paragraph.add_run(f" · {status}")
+                for block in paragraphs(answer.interpretation):
+                    paragraph.add_run(f"\n{block}")
+                if answer.notes:
+                    _muted(document, report.refs(answer.notes))
     else:
         document.add_paragraph(t["no_criteria"])
 
@@ -544,7 +632,8 @@ def render_docx(report: Report) -> bytes:
     for alert in report.alerts:
         severity = t["severity"].get(alert.severity, alert.severity)
         document.add_heading(f"{severity} · {alert.rule} · {alert.scope}", 3)
-        document.add_paragraph(alert.message)
+        for block in paragraphs(alert.message):
+            document.add_paragraph(block)
         status = t["alert_status"].get(alert.status, alert.status)
         _muted(
             document,
@@ -605,6 +694,9 @@ def render_docx(report: Report) -> bytes:
         subject = paragraph.add_run(f"\n{note.subject}")
         subject.font.size = Pt(8.5)
         subject.font.color.rgb = RGBColor.from_string(MUTED)
+        for reading in note.interpretations:
+            for block in paragraphs(reading):
+                paragraph.add_run(f"\n{block}")
         for excerpt in note.excerpts:
             paragraph.add_run(f"\n{report.quote(excerpt)}").font.size = Pt(9)
         omitted = report.omitted(note)
@@ -644,6 +736,7 @@ def _sheets(report: Report) -> list[tuple[str, list[str], list[list[Cell]]]]:
                 c["evolution"],
                 c["confidence"],
                 c["documents"],
+                c["interpretation"],
                 c["notes"],
             ],
             [
@@ -655,6 +748,7 @@ def _sheets(report: Report) -> list[tuple[str, list[str], list[list[Cell]]]]:
                     t["evolution"].get(score.evolution or "", None),
                     score.confidence,
                     score.documents,
+                    score.interpretation,
                     report.refs(pillar.notes),
                 ]
                 for pillar in report.pillars
@@ -672,6 +766,7 @@ def _sheets(report: Report) -> list[tuple[str, list[str], list[list[Cell]]]]:
                 c["value"],
                 c["documents"],
                 c["confidence"],
+                c["interpretation"],
                 c["notes"],
             ],
             [
@@ -684,6 +779,7 @@ def _sheets(report: Report) -> list[tuple[str, list[str], list[list[Cell]]]]:
                     variable.value,
                     variable.documents,
                     variable.confidence,
+                    variable.interpretation,
                     report.refs(variable.notes),
                 ]
                 for pillar in report.pillars
@@ -714,6 +810,29 @@ def _sheets(report: Report) -> list[tuple[str, list[str], list[list[Cell]]]]:
                     report.refs(criterion.notes),
                 ]
                 for criterion in report.criteria
+            ],
+        ),
+        (
+            sheets["sub_questions"],
+            [
+                c["code"],
+                c["criterion"],
+                c["sub_question"],
+                c["status"],
+                c["interpretation"],
+                c["notes"],
+            ],
+            [
+                [
+                    criterion.code,
+                    criterion.name,
+                    answer.question,
+                    t["answer_status"].get(answer.status, answer.status),
+                    answer.interpretation,
+                    report.refs(answer.notes),
+                ]
+                for criterion in report.criteria
+                for answer in criterion.answers
             ],
         ),
         (
@@ -789,6 +908,7 @@ def _sheets(report: Report) -> list[tuple[str, list[str], list[list[Cell]]]]:
                 c["page"],
                 c["section"],
                 c["subject"],
+                c["interpretation"],
                 c["excerpt"],
             ],
             [
@@ -798,6 +918,7 @@ def _sheets(report: Report) -> list[tuple[str, list[str], list[list[Cell]]]]:
                     note.page,
                     note.section,
                     note.subject,
+                    note.interpretation or None,
                     note.excerpt,
                 ]
                 for note in report.notes
@@ -811,6 +932,7 @@ WIDE_COLUMNS = {
     "text",
     "message",
     "justification",
+    "interpretation",
     "excerpt",
     "action",
     "reason",
@@ -878,6 +1000,7 @@ def render_xlsx(report: Report) -> bytes:
                     "scope",
                     "origin",
                     "subject",
+                    "sub_question",
                     "document",
                     "section",
                 }
@@ -948,7 +1071,8 @@ def render_csv(report: Report) -> bytes:
                     score.score,
                     t["evolution"].get(score.evolution or "", None),
                     score.confidence,
-                    f"{c['version']} {score.version}",
+                    f"{c['version']} {score.version}"
+                    + (f" · {score.interpretation}" if score.interpretation else ""),
                     report.refs(pillar.notes),
                 ]
             )
@@ -961,7 +1085,12 @@ def render_csv(report: Report) -> bytes:
                     variable.value,
                     t["state"].get(variable.state, variable.state),
                     variable.confidence,
-                    f"{c['version']} {variable.version}",
+                    f"{c['version']} {variable.version}"
+                    + (
+                        f" · {variable.interpretation}"
+                        if variable.interpretation
+                        else ""
+                    ),
                     report.refs(variable.notes),
                 ]
             )
@@ -979,6 +1108,19 @@ def render_csv(report: Report) -> bytes:
                 report.refs(criterion.notes),
             ]
         )
+        for answer in criterion.answers:
+            rows.append(
+                [
+                    layer["b"],
+                    c["sub_question"],
+                    f"{criterion.code} · {answer.question}",
+                    None,
+                    t["answer_status"].get(answer.status, answer.status),
+                    None,
+                    answer.interpretation,
+                    report.refs(answer.notes),
+                ]
+            )
     for alert in report.alerts:
         rows.append(
             [
@@ -1032,7 +1174,7 @@ def render_csv(report: Report) -> bytes:
                 None,
                 None,
                 None,
-                note.excerpt,
+                "\n\n".join(filter(None, [note.interpretation, note.excerpt])),
                 note.subject,
             ]
         )

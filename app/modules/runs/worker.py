@@ -1,12 +1,15 @@
 """Exécution des runs d'analyse (E6) : classification figée, variables
-intermédiaires, couche A, couche B, couche C, restitution.
+intermédiaires, couche A, couche B, couche C, lecture des documents,
+restitution. La lecture (une interprétation de chaque segment, variable et
+pilier) tourne dans l'étape `restitution`, avant la rédaction.
 
 Tourne dans le processus du worker d'ingestion, avec son modèle
 d'embeddings (recherche des extraits de la couche B). Un échec passe le run
 en `failed` sans rien publier (RG-6.1) ; une IA indisponible n'est pas un
 échec : les critères de la couche B restent non conclus, les écarts de la
 couche C gardent leur qualification par défaut, la synthèse ses libellés
-factuels, sans conclusion ni plan d'action.
+factuels, sans conclusion ni plan d'action, et les preuves restent sans
+lecture.
 """
 
 import asyncio
@@ -29,6 +32,7 @@ from app.modules.runs.domain import (
 from app.modules.runs.grader import (
     AiUsage,
     AlertQualifier,
+    EvidenceReader,
     GradingUnavailable,
     RestitutionWriter,
     SubQuestionGrader,
@@ -59,6 +63,18 @@ from app.modules.runs.layer_c import PROMPT_VERSION as ALERT_PROMPT_VERSION
 from app.modules.runs.layer_c import build_batches as build_alert_batches
 from app.modules.runs.layer_c import interpret as interpret_alerts
 from app.modules.runs.project import ProjectContext
+from app.modules.runs.reading import PROMPT_CODE as READING_PROMPT_CODE
+from app.modules.runs.reading import PROMPT_VERSION as READING_PROMPT_VERSION
+from app.modules.runs.reading import (
+    READING_VERSION,
+    ReadingInputs,
+    ReadingResults,
+    ReadingRules,
+    segments,
+    subjects,
+)
+from app.modules.runs.reading import build_batches as build_reading_batches
+from app.modules.runs.reading import interpret as interpret_readings
 from app.modules.runs.repository import ClaimedRun, RunRepository
 from app.modules.runs.restitution import PROMPT_CODE as RESTITUTION_PROMPT_CODE
 from app.modules.runs.restitution import PROMPT_VERSION as RESTITUTION_PROMPT_VERSION
@@ -76,7 +92,8 @@ logger = logging.getLogger(__name__)
 
 NOT_AVAILABLE = {"reason": "not_available"}
 RUN_ENGINE_VERSION = (
-    f"{ENGINE_VERSION}+{LAYER_B_VERSION}+{LAYER_C_VERSION}+{RESTITUTION_VERSION}"
+    f"{ENGINE_VERSION}+{LAYER_B_VERSION}+{LAYER_C_VERSION}+{READING_VERSION}"
+    f"+{RESTITUTION_VERSION}"
 )
 
 
@@ -98,6 +115,7 @@ class RunWorker:
         grader: SubQuestionGrader | None = None,
         qualifier: AlertQualifier | None = None,
         writer: RestitutionWriter | None = None,
+        reader: EvidenceReader | None = None,
         ledger: UsageLedger | None = None,
     ) -> None:
         self._repository = repository
@@ -112,6 +130,7 @@ class RunWorker:
         self._grader = grader
         self._qualifier = qualifier
         self._writer = writer
+        self._reader = reader
 
     def stop(self) -> None:
         self._stopping.set()
@@ -227,8 +246,46 @@ class RunWorker:
             step = "restitution"
             await self._repository.step(run, step, "running")
             restitution_rules = RestitutionRules()
-            restitution = await self._restitution(
-                run, layer_c_inputs, results, layer_b, layer_c, restitution_rules
+            restitution = select(
+                layer_c_inputs, results, layer_b, layer_c.alerts, restitution_rules
+            )
+            # Lecture des documents, puis rédaction : tous deux citent les
+            # mêmes extraits, lus une fois.
+            reading_rules = ReadingRules()
+            reading_inputs = ReadingInputs(
+                locale=layer_c_inputs.locale,
+                pillar_names=layer_c_inputs.pillar_names,
+                variables=await self._variable_labels(run),
+                project=project,
+            )
+            pillars = subjects(results, reading_inputs, reading_rules)
+            to_read = segments(
+                pillars,
+                layer_b,
+                [
+                    *(alert.segment_ids for alert in layer_c.alerts),
+                    *(finding.segment_ids for finding in restitution.findings),
+                ],
+            )
+            texts = known_texts(layer_b)
+            if self._reader is not None or self._writer is not None:
+                # Sans IA, aucun texte à lire : rien n'est demandé.
+                missing = [segment for segment in to_read if segment not in texts]
+                texts.update(await self._repository.segment_texts(run, missing))
+            reading = await self._reading(
+                run, reading_inputs, pillars, to_read, texts, reading_rules
+            )
+            reading.apply(payload)
+            payload["rules"] = {
+                **payload["rules"],
+                "reading": {
+                    **reading_rules.as_dict(),
+                    "ai": reading.ai,
+                    "summary": reading.summary(),
+                },
+            }
+            await self._write_restitution(
+                run, layer_c_inputs, restitution, texts, restitution_rules
             )
             payload["restitution"] = restitution.payload()
             payload["summary"] = restitution.summary()
@@ -437,16 +494,83 @@ class RunWorker:
             await self._account(run, "layer_c", ai, usages, len(batches)),
         )
 
-    async def _restitution(
+    async def _variable_labels(self, run: ClaimedRun) -> dict:
+        """Intitulés des variables ; introuvables, la lecture nomme les
+        variables par leur code."""
+        try:
+            return await self._repository.variable_labels(run)
+        except ApiError as error:
+            if error.code == "RUN_LEASE_LOST":
+                raise
+            logger.warning("Run %s: variable labels unavailable", run.run_id)
+            return {}
+
+    async def _reading(
+        self,
+        run: ClaimedRun,
+        inputs: ReadingInputs,
+        pillars: list,
+        to_read: list,
+        texts: dict,
+        rules: ReadingRules,
+    ) -> ReadingResults:
+        """Un appel IA par lot (un seul en pratique). Un lot en échec laisse
+        ses textes sans interprétation ; les autres gardent les leurs."""
+        results = ReadingResults()
+        batches = build_reading_batches(inputs, pillars, to_read, texts, rules)
+        ai: dict = {
+            "prompt": f"{READING_PROMPT_CODE}_{READING_PROMPT_VERSION}",
+            "batches": len(batches),
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_eur": "0",
+            "errors": [],
+        }
+        if not batches:
+            results.ai = {**ai, "status": "not_needed"}
+            return results
+        if self._reader is None:
+            results.ai = {**ai, "status": "unavailable", "errors": ["AI_DISABLED"]}
+            return results
+        prompt = await self._prompt(run, READING_PROMPT_CODE, READING_PROMPT_VERSION)
+        if prompt is None:
+            results.ai = {
+                **ai,
+                "status": "unavailable",
+                "errors": ["PROMPT_UNAVAILABLE"],
+            }
+            return results
+
+        usages: list[AiUsage] = []
+        for index, batch in enumerate(batches):
+            if index:
+                # Prolonge le bail entre deux appels.
+                await self._repository.step(run, "restitution", "running")
+            try:
+                raw, usage = await self._reader.read(prompt, batch)
+            except GradingUnavailable as error:
+                logger.warning(
+                    "Run %s: evidence reading unavailable (%s: %s)",
+                    run.run_id,
+                    error.code,
+                    error.message,
+                )
+                ai["errors"].append(error.code)
+                continue
+            usages.append(usage)
+            interpret_readings(batch, raw, results)
+        results.ai = await self._account(run, "reading", ai, usages, len(batches))
+        return results
+
+    async def _write_restitution(
         self,
         run: ClaimedRun,
         inputs: LayerCInputs,
-        layer_a: LayerAResults,
-        layer_b: LayerBResults | None,
-        layer_c: LayerCResults,
+        restitution: Restitution,
+        texts: dict,
         rules: RestitutionRules,
     ) -> Restitution:
-        restitution = select(inputs, layer_a, layer_b, layer_c.alerts, rules)
         ai: dict = {
             "prompt": f"{RESTITUTION_PROMPT_CODE}_{RESTITUTION_PROMPT_VERSION}",
             "batches": 0,
@@ -473,16 +597,8 @@ class RunWorker:
             }
             return restitution
 
-        texts = known_texts(layer_b)
-        missing = list(
-            dict.fromkeys(
-                segment
-                for finding in restitution.findings
-                for segment in finding.segment_ids
-                if segment not in texts
-            )
-        )
-        texts.update(await self._repository.segment_texts(run, missing))
+        # Prolonge le bail après la lecture.
+        await self._repository.step(run, "restitution", "running")
         batch = build_restitution_batch(
             inputs.locale, restitution, texts, rules, inputs.project
         )

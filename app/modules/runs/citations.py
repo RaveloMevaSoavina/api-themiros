@@ -216,18 +216,21 @@ def read(
     limit: int,
     max_chars: int,
     fallback: Sequence[Span] = (),
+    min_chars: int = 0,
 ) -> Reading | None:
     """Interprétation de l'extrait `key` : ses sources ne peuvent être que
     ses propres phrases (« [E1.2] ») ; une référence à un autre extrait
     disparaît. Sans source valable, elle renvoie aux phrases `fallback`
     (celles que les autres textes citent), à défaut à l'extrait entier :
     une interprétation mène toujours au passage surligné. `None` si le
-    texte est vide."""
+    texte est vide ou plus court que `min_chars` hors marqueurs."""
     if not text or not text.strip() or key not in excerpts:
         return None
     allowed = (key,)
     citations = Citations(excerpts)
     original = truncate(citations.cite(text, allowed), limit)
+    if not long_enough(original, min_chars):
+        return None
     versions = {
         locale: truncate(citations.cite(value, allowed), limit)
         for locale, value in translated.items()
@@ -250,6 +253,73 @@ def read(
         },
         citations=sources,
     )
+
+
+def long_enough(text: str | None, min_chars: int) -> bool:
+    """Au moins `min_chars` caractères hors marqueurs : un paragraphe, pas
+    une phrase de circonstance."""
+    return len(plain(text).strip()) >= min_chars
+
+
+def written(
+    text: str | None,
+    translated: Mapping[str, str | None],
+    excerpts: Mapping[str, Excerpt],
+    allowed: Collection[str] | None,
+    limit: int,
+    max_chars: int,
+    min_chars: int = 0,
+) -> Reading | None:
+    """Interprétation rédigée par l'IA (variable, pilier, sous-question,
+    écart…) et ses traductions : sources numérotées, les mêmes dans toutes
+    les langues, prises parmi les extraits `allowed`. `None` si le texte est
+    vide, plus court que `min_chars` hors marqueurs, ou sans aucune source
+    valable : une interprétation sans source n'est pas publiée. Une
+    traduction trop courte est ignorée (le texte s'affiche dans la langue du
+    run)."""
+    if not text or not text.strip():
+        return None
+    citations = Citations(excerpts)
+    original = truncate(citations.cite(text, allowed), limit)
+    if not long_enough(original, min_chars):
+        return None
+    versions = {
+        locale: truncate(citations.cite(value, allowed), limit)
+        for locale, value in translated.items()
+        if value and value.strip()
+    }
+    locales = [
+        locale for locale, value in versions.items() if long_enough(value, min_chars)
+    ]
+    texts, sources = compact(
+        [original, *(versions[locale] for locale in locales)], citations.sources
+    )
+    if not sources:
+        return None
+    return Reading(
+        text=fit(texts[0] or "", max_chars),
+        translations={
+            locale: fit(value or "", max_chars)
+            for locale, value in zip(locales, texts[1:], strict=True)
+            if value
+        },
+        citations=sources,
+    )
+
+
+def reading_payload(reading: Reading | None) -> dict[str, Any]:
+    """Champs `interpretation*` du corps de `complete_run`."""
+    if reading is None:
+        return {
+            "interpretation": None,
+            "interpretation_translations": {},
+            "interpretation_citations": [],
+        }
+    return {
+        "interpretation": reading.text,
+        "interpretation_translations": reading.translations,
+        "interpretation_citations": [source.as_dict() for source in reading.citations],
+    }
 
 
 _END = re.compile(r"([.!?…]*)\s*$")

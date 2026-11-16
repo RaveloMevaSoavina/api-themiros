@@ -2,8 +2,8 @@
 
 Les écritures passent par les fonctions SQL des migrations
 `20261020000002_analysis_runs.sql`, `20261020000003_run_results.sql`,
-`20261021000002_layer_b.sql` et `20261021000005_layer_c.sql`, conditionnées
-au bail.
+`20261021000002_layer_b.sql`, `20261021000005_layer_c.sql` et
+`20261116000001_paragraph_interpretations.sql`, conditionnées au bail.
 """
 
 from dataclasses import dataclass
@@ -17,6 +17,7 @@ from app.modules.runs.domain import RunInputs
 from app.modules.runs.layer_b import Candidate, LayerBInputs
 from app.modules.runs.layer_c import LayerCInputs
 from app.modules.runs.project import ProjectContext
+from app.modules.runs.reading import ReadingInputs, VariableLabel
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,15 @@ class RunRepository:
             "run_layer_c_inputs", payload=self._lease(run), request_timeout=60
         )
         return LayerCInputs.from_row(row or {})
+
+    async def variable_labels(
+        self, run: ClaimedRun
+    ) -> dict[tuple[UUID, str], VariableLabel]:
+        """Intitulés des variables du cadre, dans la langue de l'approche."""
+        rows = await self._gateway.service_rpc(
+            "run_variable_labels", payload=self._lease(run), request_timeout=60
+        )
+        return ReadingInputs.labels(rows if isinstance(rows, list) else [])
 
     async def project(self, run: ClaimedRun) -> ProjectContext:
         """Le projet évalué : situe les extraits dans les prompts du run."""
