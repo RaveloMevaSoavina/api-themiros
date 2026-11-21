@@ -4,17 +4,21 @@ Déroulé, pour un run :
 
 1. `retrieve` : les extraits de chaque sous-question sont les segments du
    corpus les plus proches (recherche vectorielle faite en SQL) au-dessus du
-   seuil de similarité ;
-2. `build_batches` : seuls les critères dont au moins 50 % des sous-questions
-   ont des extraits sont soumis à l'IA (RG-1) ; les autres sont non conclus
-   sans appel. Tout le run tient en un seul appel : extraits dédoublonnés,
-   découpés en phrases, désignés par des identifiants courts (E1, Q1, C1).
-   Plusieurs appels seulement si le volume dépasse le plafond ;
+   seuil de similarité ; `propose` y ajoute, pour une sous-question qui n'en
+   a aucun, ses segments les plus proches sous le seuil : l'IA juge s'ils
+   répondent ;
+2. `build_batches` : toutes les sous-questions sont soumises à l'IA, même
+   celles d'un critère sous 50 % (RG-1 ne joue que sur la note) : chacune
+   reçoit une réponse. Tout le run tient en un seul appel : extraits
+   dédoublonnés, découpés en phrases, désignés par des identifiants courts
+   (E1, Q1, C1). Plusieurs appels seulement si le volume dépasse le plafond ;
 3. `interpret` : une sous-question n'est documentée que si l'IA lui donne une
    note en citant au moins un de ses propres extraits (GF-1, RG-4). L'IA
    cite des phrases (E1.2) : la preuve garde leurs positions, que le
    surlignage reprend. Chaque sous-question reçoit un paragraphe qui
-   interprète sa réponse, chaque critère une justification argumentée ;
+   interprète sa réponse, documentée ou non (une réponse non documentée dit
+   ce que les documents montrent de plus proche et ce qui manque, avec ses
+   sources quand elle en a), chaque critère une justification argumentée ;
    tous deux citent leurs sources dans le texte et sont traduits dans les
    autres langues de l'interface par le même appel (`tr`). Un texte trop
    court ou sans source n'est pas publié. Les extraits eux-mêmes sont lus
@@ -51,15 +55,17 @@ from app.modules.runs.citations import (
 )
 from app.modules.runs.project import ProjectContext
 
-LAYER_B_VERSION = "layer-b/1.4.0"
+LAYER_B_VERSION = "layer-b/1.5.0"
 PROMPT_CODE = "grade_sub_questions"
 # v1.1 : extraits en phrases, phrases citées, interprétation de chaque
 # extrait cité, sources dans la justification. v1.2 : le projet évalué
 # (`pj`), sujet des justifications et des interprétations, qui citent
 # leurs phrases. v1.3 : interprétation en paragraphe de chaque
 # sous-question, justification argumentée, traductions (`tr`) ; les
-# extraits sont lus par l'étape de lecture.
-PROMPT_VERSION = "v1.3"
+# extraits sont lus par l'étape de lecture. v1.4 : toutes les sous-questions
+# reçoivent une réponse, même sans note (ce que montrent les documents, ce
+# qui manque) ; extraits les plus proches proposés sous le seuil.
+PROMPT_VERSION = "v1.4"
 
 NoteStatus = Literal["conclu", "non_conclu"]
 AnswerStatus = Literal["documentee", "non_documentee"]
@@ -82,6 +88,9 @@ JUSTIFICATION_CHARS = 1400
 JUSTIFICATION_MIN_CHARS = 200
 INTERPRETATION_CHARS = 800
 INTERPRETATION_MIN_CHARS = 120
+# Réponse d'une sous-question non documentée (150 à 450 caractères
+# demandés) : plus courte, elle dit surtout ce qui manque.
+ANSWER_MIN_CHARS = 80
 # Plafonds de la base, marqueurs compris.
 JUSTIFICATION_MAX_CHARS = 2000
 INTERPRETATION_MAX_CHARS = 1500
@@ -98,6 +107,9 @@ class LayerBRules:
     # documents en proposent : la convergence entre documents se lit mieux.
     max_per_document: int | None = 3
     excerpts_per_question: int = 3
+    # Sous-question sans extrait au-dessus du seuil : ses segments les plus
+    # proches lui sont proposés quand même, l'IA jugeant s'ils répondent.
+    fallback_excerpts: int = 2
     excerpt_chars: int = 600
     max_input_tokens: int = 30000
     max_output_tokens: int = 16000
@@ -294,6 +306,9 @@ class Grading:
     grades: dict[UUID, Grade] = field(default_factory=dict)
     # Justification sourcée et traduite de chaque critère.
     justifications: dict[UUID, Reading] = field(default_factory=dict)
+    # Réponse des sous-questions non documentées (sans note) : ce que les
+    # documents montrent de plus proche, ce qui manque.
+    answers: dict[UUID, Reading] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -414,6 +429,33 @@ def retrieve(
     }
 
 
+def propose(
+    candidates: Iterable[Candidate],
+    retrieved: Mapping[UUID, list[Candidate]],
+    rules: LayerBRules,
+) -> dict[UUID, list[Candidate]]:
+    """Extraits soumis à l'IA : ceux de `retrieve`, et pour une sous-question
+    qui n'en a aucun, ses `fallback_excerpts` segments les plus proches sous
+    le seuil. Chaque sous-question reçoit ainsi une réponse lue dans les
+    documents ; l'IA seule dit si ces extraits y répondent."""
+    proposed = {key: list(value) for key, value in retrieved.items() if value}
+    if rules.fallback_excerpts <= 0:
+        return proposed
+    nearest: dict[UUID, dict[UUID, Candidate]] = defaultdict(dict)
+    for candidate in candidates:
+        if candidate.sub_question_id in proposed:
+            continue
+        kept = nearest[candidate.sub_question_id]
+        current = kept.get(candidate.segment_id)
+        if current is None or candidate.rank_key() < current.rank_key():
+            kept[candidate.segment_id] = candidate
+    for question_id, kept in nearest.items():
+        proposed[question_id] = sorted(kept.values(), key=Candidate.rank_key)[
+            : rules.fallback_excerpts
+        ]
+    return proposed
+
+
 def _diversified(ranked: list[Candidate], rules: LayerBRules) -> list[Candidate]:
     """Les `top_k` premiers, sans qu'un document en occupe plus de
     `max_per_document` ; si les autres documents n'en proposent pas assez,
@@ -457,18 +499,15 @@ def build_batches(
     retrieved: Mapping[UUID, list[Candidate]],
     rules: LayerBRules,
 ) -> list[GradingBatch]:
-    """Lots d'appels IA : un seul en pratique. Un critère n'est jamais
-    coupé entre deux appels ; un lot est fermé quand le critère suivant
-    ferait dépasser le plafond d'entrée ou de sortie."""
+    """Lots d'appels IA : un seul en pratique. Toutes les sous-questions
+    sont soumises, avec ou sans extrait : chacune reçoit une réponse. Un
+    critère n'est jamais coupé entre deux appels ; un lot est fermé quand le
+    critère suivant ferait dépasser le plafond d'entrée ou de sortie."""
     batches: list[GradingBatch] = []
     current = GradingBatch()
     for criterion in inputs.criteria:
-        asked = [
-            question for question in criterion.questions if retrieved.get(question.id)
-        ]
-        if not is_documented_enough(
-            len(asked), len(criterion.questions), rules.documented_ratio
-        ):
+        asked = list(criterion.questions)
+        if not asked:
             continue
         candidate = _with_criterion(current, inputs, criterion, asked, retrieved, rules)
         if current.criteria and (
@@ -512,7 +551,7 @@ def _with_criterion(
         question_key = f"Q{len(question_keys) + 1}"
         question_keys[question_key] = question.id
         keys: list[str] = []
-        for candidate in retrieved[question.id][: rules.excerpts_per_question]:
+        for candidate in retrieved.get(question.id, [])[: rules.excerpts_per_question]:
             key = key_of_segment.get(candidate.segment_id)
             if key is None:
                 key = f"E{len(excerpt_keys) + 1}"
@@ -574,10 +613,11 @@ def _with_criterion(
 def interpret(batch: GradingBatch, raw: RawGrading, grading: Grading) -> None:
     """Ajoute à `grading` les notes valides d'une réponse IA. Une note hors
     barème, sans extrait cité, ou citant un extrait qui n'était pas proposé
-    pour la question, n'est pas retenue : la question reste non documentée.
-    L'interprétation d'une sous-question cite ses propres extraits, celle
-    d'un critère les extraits de ses sous-questions ; trop courte ou sans
-    source, elle n'est pas publiée."""
+    pour la question, n'est pas retenue : la question reste non documentée,
+    mais sa réponse est gardée (`grading.answers`), avec les sources
+    qu'elle cite parmi ses extraits. L'interprétation d'une sous-question
+    notée cite ses propres extraits, celle d'un critère les extraits de ses
+    sous-questions ; trop courte ou sans source, elle n'est pas publiée."""
     grading.graded_criteria.update(criterion.id for criterion in batch.criteria)
     translations = {
         locale: raw.translations[locale]
@@ -588,18 +628,37 @@ def interpret(batch: GradingBatch, raw: RawGrading, grading: Grading) -> None:
         question_id = batch.question_keys.get(raw_grade.key)
         if question_id is None or question_id in grading.grades:
             continue
-        if raw_grade.note is None or raw_grade.note not in (0, 1, 2, 3):
-            continue
         allowed = batch.allowed.get(question_id, frozenset())
-        found = cited(raw_grade.excerpts, batch.excerpts, allowed)
+        translated = {
+            locale: translation.interpretations.get(raw_grade.key)
+            for locale, translation in translations.items()
+        }
+        found = (
+            cited(raw_grade.excerpts, batch.excerpts, allowed)
+            if raw_grade.note in (0, 1, 2, 3)
+            else {}
+        )
         if not found:
+            # Non documentée : la réponse dit ce que les documents montrent
+            # de plus proche et ce qui manque ; elle peut n'avoir aucune
+            # source (aucun extrait ne touche la question).
+            answer = written(
+                raw_grade.interpretation,
+                translated,
+                batch.excerpts,
+                allowed,
+                INTERPRETATION_CHARS,
+                INTERPRETATION_MAX_CHARS,
+                ANSWER_MIN_CHARS,
+                require_sources=False,
+            )
+            if answer is not None:
+                grading.answers.setdefault(question_id, answer)
             continue
+        grading.answers.pop(question_id, None)
         interpretation = written(
             raw_grade.interpretation,
-            {
-                locale: translation.interpretations.get(raw_grade.key)
-                for locale, translation in translations.items()
-            },
+            translated,
             batch.excerpts,
             allowed,
             INTERPRETATION_CHARS,
@@ -681,7 +740,13 @@ def finalize(
     grading: Grading,
     rules: LayerBRules,
     new_id: Callable[[], UUID] = uuid4,
+    proposed: Mapping[UUID, list[Candidate]] | None = None,
 ) -> LayerBResults:
+    """`retrieved` : extraits au-dessus du seuil ; `proposed` : extraits
+    soumis à l'IA (par défaut les mêmes), parmi lesquels sont prises les
+    preuves des sous-questions notées ou répondues."""
+    if proposed is None:
+        proposed = retrieved
     notes: list[CriterionNote] = []
     answers: list[SubAnswerResult] = []
     for criterion in inputs.criteria:
@@ -691,11 +756,20 @@ def finalize(
         for question in criterion.questions:
             candidates = retrieved.get(question.id, [])
             grade = grading.grades.get(question.id) if graded else None
+            answer = grading.answers.get(question.id) if graded else None
+            interpretation = grade.interpretation if grade else answer
             if graded:
                 # Notée par l'IA : documentée seulement si elle cite un extrait.
+                # Preuves : extraits de la note et de la réponse.
                 is_documented = grade is not None
                 cited = set(grade.segment_ids) if grade else set()
-                evidences = [c for c in candidates if c.segment_id in cited]
+                if interpretation is not None:
+                    cited.update(
+                        source.segment_id for source in interpretation.citations
+                    )
+                evidences = [
+                    c for c in proposed.get(question.id, []) if c.segment_id in cited
+                ]
             else:
                 # Non soumise (critère sous 50 %, ou IA indisponible) : la
                 # recherche seule dit si des extraits existent.
@@ -714,8 +788,8 @@ def finalize(
                     contradictory=grade.contradictory if grade else False,
                     evidences=evidences,
                     criterion_id=criterion.id,
-                    spans=grade.spans if grade else {},
-                    interpretation=grade.interpretation if grade else None,
+                    spans=grade.spans if grade else _answer_spans(answer),
+                    interpretation=interpretation,
                 )
             )
 
@@ -729,6 +803,12 @@ def finalize(
         else:
             reason = "concluded"
         if reason != "concluded":
+            # Sous 50 % mais lu par l'IA : sa justification dit ce qui manque.
+            written_insufficient = (
+                grading.justifications.get(criterion.id)
+                if reason == "insufficient" and graded
+                else None
+            )
             notes.append(
                 CriterionNote(
                     criterion_id=criterion.id,
@@ -736,10 +816,11 @@ def finalize(
                     status="non_conclu",
                     documented=documented,
                     total=total,
-                    justification=justification(
-                        inputs.locale, reason, documented, total
-                    ),
+                    justification=written_insufficient.text
+                    if written_insufficient
+                    else justification(inputs.locale, reason, documented, total),
                     ambiguous=False,
+                    written=written_insufficient,
                 )
             )
             continue
@@ -759,3 +840,14 @@ def finalize(
             )
         )
     return LayerBResults(notes=notes, answers=answers)
+
+
+def _answer_spans(answer: Reading | None) -> Mapping[UUID, tuple[Span, ...]]:
+    """Phrases citées par la réponse d'une sous-question non documentée :
+    elles sont surlignées dans ses preuves."""
+    if answer is None:
+        return {}
+    spans: dict[UUID, list[Span]] = defaultdict(list)
+    for source in answer.citations:
+        spans[source.segment_id].extend(source.spans)
+    return {segment: tuple(merge(found)) for segment, found in spans.items() if found}

@@ -15,6 +15,7 @@ from app.modules.runs.layer_b import (
     build_batches,
     finalize,
     interpret,
+    propose,
     retrieve,
     truncate,
 )
@@ -142,7 +143,7 @@ def test_one_document_does_not_take_every_place() -> None:
     assert kept == sorted(kept, key=lambda candidate: -candidate.similarity)
 
 
-def test_a_criterion_under_half_documented_is_not_sent_to_the_ai() -> None:
+def test_every_sub_question_is_sent_to_the_ai() -> None:
     pertinence = _criterion("Pertinence", 3)
     impact = _criterion("Impact", 3)
     candidates = [_candidate(question) for question in pertinence.questions[:2]]
@@ -152,9 +153,87 @@ def test_a_criterion_under_half_documented_is_not_sent_to_the_ai() -> None:
         _inputs(pertinence, impact), retrieve(candidates, RULES), RULES
     )
 
+    # Même sous 50 % (Impact) ou sans extrait : chaque sous-question reçoit
+    # une réponse ; RG-1 ne joue que sur la note.
     (batch,) = batches
-    assert batch.criteria == [pertinence]
-    assert len(batch.question_keys) == 2
+    assert batch.criteria == [pertinence, impact]
+    assert len(batch.question_keys) == 6
+    content = json.loads(batch.message())
+    assert content["c"][0]["q"][2]["e"] == []
+
+
+def test_closest_extracts_are_proposed_below_the_threshold() -> None:
+    criterion = _criterion("Pertinence", 2)
+    first, second = criterion.questions
+    above = _candidate(first, 0.6)
+    below = [_candidate(second, 0.3), _candidate(second, 0.2), _candidate(second, 0.1)]
+    retrieved = retrieve([above, *below], RULES)
+
+    proposed = propose([above, *below], retrieved, RULES)
+
+    assert second.id not in retrieved
+    assert proposed[first.id] == [above]
+    assert proposed[second.id] == below[:2]
+    assert propose(below, {}, replace(RULES, fallback_excerpts=0)) == {}
+
+
+def test_an_undocumented_sub_question_keeps_its_answer_and_sources() -> None:
+    criterion = _criterion("Pertinence", 3)
+    first, second, third = criterion.questions
+    candidates = [
+        _candidate(first),
+        _candidate(second),
+        _candidate(third, 0.3),  # sous le seuil : proposé, pas retrouvé
+    ]
+    retrieved = retrieve(candidates, RULES)
+    proposed = propose(candidates, retrieved, RULES)
+    (batch,) = build_batches(_inputs(criterion), proposed, RULES)
+    keys = list(batch.question_keys)
+    closest = (
+        "Les documents du projet évoquent un comité de suivi [E3] sans dire "
+        "comment il consulte les communautés ni à quelle fréquence."
+    )
+    unsourced = (
+        "Les documents du projet ne renseignent pas ce point : il faudrait y "
+        "trouver un rapport de suivi."
+    )
+    grading = Grading()
+    interpret(
+        batch,
+        RawGrading(
+            grades=(
+                RawGrade(keys[0], 3, ("E1",), False, JUSTIFIED.replace("[E1]", "[E1]")),
+                RawGrade(keys[1], None, (), False, unsourced),
+                RawGrade(keys[2], None, (), False, closest),
+            ),
+            justifications={"C1": JUSTIFIED},
+        ),
+        grading,
+    )
+    results = finalize(_inputs(criterion), retrieved, grading, RULES, proposed=proposed)
+
+    answers = {answer.sub_question_id: answer for answer in results.answers}
+    assert [answers[q.id].status for q in criterion.questions] == [
+        "documentee",
+        "non_documentee",
+        "non_documentee",
+    ]
+    # Réponse sans source : publiée quand même, sans preuve.
+    assert answers[second.id].interpretation.text.startswith("Les documents du projet")
+    assert answers[second.id].interpretation.citations == []
+    assert answers[second.id].evidences == []
+    # Réponse sourcée : sa preuve est l'extrait proposé sous le seuil.
+    assert "⟦1⟧" in answers[third.id].interpretation.text
+    assert [c.segment_id for c in answers[third.id].evidences] == [
+        candidates[2].segment_id
+    ]
+    assert answers[third.id].note is None
+    payload = results.payload()
+    assert len(payload["evidences"]) == 2
+    # RG-1 : une sur trois documentée, pas de note ; justification de l'IA.
+    (note,) = results.notes
+    assert note.status == "non_conclu" and note.note is None
+    assert note.written is not None
 
 
 def test_the_whole_run_fits_in_one_call_with_shared_extracts() -> None:

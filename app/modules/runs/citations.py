@@ -269,12 +269,15 @@ def written(
     limit: int,
     max_chars: int,
     min_chars: int = 0,
+    require_sources: bool = True,
 ) -> Reading | None:
     """Interprétation rédigée par l'IA (variable, pilier, sous-question,
     écart…) et ses traductions : sources numérotées, les mêmes dans toutes
     les langues, prises parmi les extraits `allowed`. `None` si le texte est
     vide, plus court que `min_chars` hors marqueurs, ou sans aucune source
-    valable : une interprétation sans source n'est pas publiée. Une
+    valable : une interprétation sans source n'est pas publiée, sauf
+    `require_sources=False` (réponse qui constate ce que les documents ne
+    disent pas : elle cite ce qu'elle peut, sans y être tenue). Une
     traduction trop courte est ignorée (le texte s'affiche dans la langue du
     run)."""
     if not text or not text.strip():
@@ -294,7 +297,7 @@ def written(
     texts, sources = compact(
         [original, *(versions[locale] for locale in locales)], citations.sources
     )
-    if not sources:
+    if not sources and require_sources:
         return None
     return Reading(
         text=fit(texts[0] or "", max_chars),

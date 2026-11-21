@@ -168,7 +168,7 @@ async def test_empty_queue_does_nothing() -> None:
     assert repository.claims == [
         (
             "host-1#runs",
-            "layer-a/1.0.0+layer-b/1.4.0+layer-c/1.2.0+reading/1.0.0+restitution/1.6.0",
+            "layer-a/1.0.0+layer-b/1.5.0+layer-c/1.2.0+reading/1.0.0+restitution/1.6.0",
         )
     ]
 
@@ -292,7 +292,9 @@ class FakeGrader:
         self.batches.append(batch)
         if self.error:
             raise self.error
-        first = sorted(next(iter(batch.allowed.values())))[0]
+        first = min(
+            (key for keys in batch.allowed.values() for key in keys), default=""
+        )
         return (
             RawGrading(
                 grades=tuple(
@@ -359,7 +361,7 @@ async def test_layer_b_rates_the_criteria_in_a_single_ai_call() -> None:
     assert len(results["layer_b"]["evidences"]) == 2
     ai = results["rules"]["layer_b"]["ai"]
     assert ai["status"] == "completed" and ai["calls"] == 1
-    assert ai["prompt"] == "grade_sub_questions_v1.3"
+    assert ai["prompt"] == "grade_sub_questions_v1.4"
     assert (ai["input_tokens"], ai["output_tokens"]) == (1200, 80)
     summary = next(
         s for n, st, s in repository.steps if (n, st) == ("layer_b", "completed")
@@ -435,17 +437,23 @@ async def test_an_ai_failure_does_not_fail_the_run() -> None:
     assert repository.failures == []
 
 
-async def test_no_ai_call_when_no_criterion_is_documented_enough() -> None:
+async def test_every_sub_question_is_answered_even_without_extracts() -> None:
     repository = _layer_b_repository()
     repository.matches = []
     grader = FakeGrader()
 
     await _layer_b_worker(repository, grader).run_once()
 
-    assert grader.calls == 0
+    # Chaque sous-question part vers l'IA, même sans extrait : elle reçoit
+    # une réponse, mais reste non documentée et le critère non conclu.
+    assert grader.calls == 1
+    content = grader.batches[0].content
+    assert [len(item["q"]) for item in content["c"]] == [len(QUESTIONS)]
+    assert all(question["e"] == [] for question in content["c"][0]["q"])
     (results,) = repository.completed
-    assert results["rules"]["layer_b"]["ai"]["status"] == "not_needed"
-    assert results["layer_b"]["notes"][0]["documented_sub_questions"] == 0
+    note = results["layer_b"]["notes"][0]
+    assert note["status"] == "non_conclu" and note["documented_sub_questions"] == 0
+    assert results["layer_b"]["evidences"] == []
 
 
 class FakeQualifier:

@@ -48,6 +48,7 @@ from app.modules.runs.layer_b import (
     build_batches,
     finalize,
     interpret,
+    propose,
     retrieve,
 )
 from app.modules.runs.layer_c import (
@@ -369,9 +370,11 @@ class RunWorker:
                 rules.top_k,
             )
         retrieved = retrieve(candidates, rules)
-        batches = build_batches(inputs, retrieved, rules)
+        # Toute sous-question part avec des extraits, au besoin sous le seuil.
+        proposed = propose(candidates, retrieved, rules)
+        batches = build_batches(inputs, proposed, rules)
         grading, ai = await self._grade(run, batches)
-        results = finalize(inputs, retrieved, grading, rules)
+        results = finalize(inputs, retrieved, grading, rules, proposed=proposed)
         results.ai = ai
         return results
 
