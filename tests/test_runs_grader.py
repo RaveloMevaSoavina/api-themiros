@@ -372,3 +372,35 @@ async def test_one_structured_call_reads_extracts_variables_and_pillars() -> Non
 def test_no_evidence_reader_when_ai_is_disabled() -> None:
     assert build_evidence_reader(Settings(ai_provider="disabled")) is None
     assert build_evidence_reader(_settings()) is not None
+
+
+class RejectingTemperature(FakeResponses):
+    """Refuse `temperature` comme gpt-6-astra, puis répond."""
+
+    def __init__(self, output) -> None:
+        super().__init__(output=output)
+        self.requests: list[dict] = []
+
+    async def parse(self, **kwargs):
+        self.requests.append(dict(kwargs))
+        if "temperature" in kwargs:
+            request = httpx.Request("POST", "https://api.openai.test/v1/responses")
+            raise openai.BadRequestError(
+                "Unsupported parameter: 'temperature'",
+                response=httpx.Response(400, request=request),
+                body={"param": "temperature"},
+            )
+        return await super().parse(**kwargs)
+
+
+async def test_an_unsupported_temperature_is_dropped_and_the_call_retried() -> None:
+    client = FakeOpenAI()
+    client.responses = RejectingTemperature(OUTPUT)
+
+    raw, _ = await OpenAISubQuestionGrader(_settings(), client).grade(PROMPT, _batch())
+
+    assert [("temperature" in request) for request in client.responses.requests] == [
+        True,
+        False,
+    ]
+    assert raw.grades[0].note == 2

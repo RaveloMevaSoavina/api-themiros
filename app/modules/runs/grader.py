@@ -14,6 +14,7 @@ par défaut, les preuves restent sans lecture, la synthèse garde ses
 libellés factuels ; le run continue.
 """
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
@@ -42,6 +43,13 @@ from app.modules.runs.restitution import (
 )
 
 MILLION = Decimal("1000000")
+
+
+logger = logging.getLogger(__name__)
+
+# Paramètres d'appel qu'un modèle peut refuser sans que la requête perde son
+# sens : ils sont alors retirés.
+OPTIONAL_PARAMETERS = frozenset({"temperature"})
 
 
 class GradingUnavailable(Exception):
@@ -253,7 +261,19 @@ class OpenAIStructuredCall:
             request["temperature"] = float(parameters["temperature"])
 
         try:
-            response = await self._client.responses.parse(**request)
+            try:
+                response = await self._client.responses.parse(**request)
+            except openai.BadRequestError as error:
+                # Paramètre facultatif refusé par ce modèle (gpt-6-astra
+                # refuse `temperature`) : l'appel est relancé sans lui plutôt
+                # que de laisser toute l'étape sans IA.
+                if getattr(error, "param", None) not in OPTIONAL_PARAMETERS or (
+                    error.param not in request
+                ):
+                    raise
+                logger.warning("AI parameter %s unsupported, dropped", error.param)
+                request.pop(error.param)
+                response = await self._client.responses.parse(**request)
         except (openai.APIConnectionError, openai.APITimeoutError) as error:
             raise GradingUnavailable(
                 "AI_PROVIDER_UNAVAILABLE", "Connexion au fournisseur IA impossible"

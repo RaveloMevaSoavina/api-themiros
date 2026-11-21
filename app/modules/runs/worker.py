@@ -15,9 +15,11 @@ lecture.
 import asyncio
 import contextlib
 import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from app.core.config import Settings
 from app.core.errors import ApiError
@@ -275,9 +277,17 @@ class RunWorker:
                 # Sans IA, aucun texte à lire : rien n'est demandé.
                 missing = [segment for segment in to_read if segment not in texts]
                 texts.update(await self._repository.segment_texts(run, missing))
-            reading = await self._reading(
-                run, reading_inputs, pillars, to_read, texts, reading_rules
-            )
+            # Lecture et rédaction sont indépendantes (même textes, sorties
+            # distinctes) : elles tournent ensemble, le bail prolongé en fond.
+            async with self._keep_lease(run, "restitution"):
+                reading, _ = await _all(
+                    self._reading(
+                        run, reading_inputs, pillars, to_read, texts, reading_rules
+                    ),
+                    self._write_restitution(
+                        run, layer_c_inputs, restitution, texts, restitution_rules
+                    ),
+                )
             reading.apply(payload)
             payload["rules"] = {
                 **payload["rules"],
@@ -287,9 +297,6 @@ class RunWorker:
                     "summary": reading.summary(),
                 },
             }
-            await self._write_restitution(
-                run, layer_c_inputs, restitution, texts, restitution_rules
-            )
             payload["restitution"] = restitution.payload()
             payload["summary"] = restitution.summary()
             payload["rules"] = {
@@ -405,22 +412,23 @@ class RunWorker:
                 "errors": ["PROMPT_UNAVAILABLE"],
             }
 
+        grader = self._grader
         usages: list[AiUsage] = []
-        for index, batch in enumerate(batches):
-            if index:
-                # Prolonge le bail entre deux appels.
-                await self._repository.step(run, "layer_b", "running")
-            try:
-                raw, usage = await self._grader.grade(prompt, batch)
-            except GradingUnavailable as error:
+        async with self._keep_lease(run, "layer_b"):
+            answers = await self._concurrently(
+                [lambda batch=batch: grader.grade(prompt, batch) for batch in batches]
+            )
+        for batch, answer in zip(batches, answers, strict=True):
+            if isinstance(answer, GradingUnavailable):
                 logger.warning(
                     "Run %s: layer B grading unavailable (%s: %s)",
                     run.run_id,
-                    error.code,
-                    error.message,
+                    answer.code,
+                    answer.message,
                 )
-                ai["errors"].append(error.code)
+                ai["errors"].append(answer.code)
                 continue
+            raw, usage = answer
             usages.append(usage)
             interpret(batch, raw, grading)
 
@@ -549,22 +557,24 @@ class RunWorker:
             }
             return results
 
+        reader = self._reader
         usages: list[AiUsage] = []
-        for index, batch in enumerate(batches):
-            if index:
-                # Prolonge le bail entre deux appels.
-                await self._repository.step(run, "restitution", "running")
-            try:
-                raw, usage = await self._reader.read(prompt, batch)
-            except GradingUnavailable as error:
+        # Lots lus en parallèle : la durée de l'étape est celle du lot le
+        # plus long, plus celle du plus lent des lots, pas leur somme.
+        answers = await self._concurrently(
+            [lambda batch=batch: reader.read(prompt, batch) for batch in batches]
+        )
+        for batch, answer in zip(batches, answers, strict=True):
+            if isinstance(answer, GradingUnavailable):
                 logger.warning(
                     "Run %s: evidence reading unavailable (%s: %s)",
                     run.run_id,
-                    error.code,
-                    error.message,
+                    answer.code,
+                    answer.message,
                 )
-                ai["errors"].append(error.code)
+                ai["errors"].append(answer.code)
                 continue
+            raw, usage = answer
             usages.append(usage)
             interpret_readings(batch, raw, results)
         results.ai = await self._account(run, "reading", ai, usages, len(batches))
@@ -604,8 +614,6 @@ class RunWorker:
             }
             return restitution
 
-        # Prolonge le bail après la lecture.
-        await self._repository.step(run, "restitution", "running")
         batch = build_restitution_batch(
             inputs.locale, restitution, texts, rules, inputs.project
         )
@@ -626,6 +634,51 @@ class RunWorker:
             interpret_restitution(restitution, batch, raw)
         restitution.ai = await self._account(run, "restitution", ai, usages, 1)
         return restitution
+
+    async def _concurrently[T](
+        self, calls: list[Callable[[], Awaitable[T]]]
+    ) -> list[T | GradingUnavailable]:
+        """Appels IA d'une étape, au plus `run_ai_concurrency` à la fois, dans
+        l'ordre des lots. Une IA indisponible pour un lot est rendue à sa
+        place (les autres lots gardent leur réponse) ; toute autre erreur
+        interrompt l'étape."""
+        limit = asyncio.Semaphore(self._settings.run_ai_concurrency)
+
+        async def bounded(call: Callable[[], Awaitable[T]]) -> T | GradingUnavailable:
+            async with limit:
+                try:
+                    return await call()
+                except GradingUnavailable as error:
+                    return error
+
+        return list(await _all(*(bounded(call) for call in calls)))
+
+    @contextlib.asynccontextmanager
+    async def _keep_lease(self, run: ClaimedRun, step: str) -> AsyncIterator[None]:
+        """Prolonge le bail du run pendant des appels IA longs et simultanés
+        (un tiers du bail entre deux prolongations). Un bail perdu arrête la
+        prolongation : `complete_run` le constatera ; un incident passager
+        est seulement consigné."""
+        period = max(self._settings.run_lease_seconds / 3, 1)
+
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(period)
+                try:
+                    await self._repository.step(run, step, "running")
+                except ApiError as error:
+                    if error.code == "RUN_LEASE_LOST":
+                        logger.warning("Run %s: lease lost", run.run_id)
+                        return
+                    logger.warning("Run %s: lease renewal failed", run.run_id)
+
+        heartbeat = asyncio.create_task(beat())
+        try:
+            yield
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
 
     async def _prompt(self, run: ClaimedRun, code: str, version: str) -> dict | None:
         """Prompt actif, ou `None` s'il est introuvable : l'étape continue
@@ -700,3 +753,18 @@ class RunWorker:
                 "FRAMEWORK_CHANGED",
                 "Le cadre a été revalidé depuis le lancement : relancez l'analyse",
             )
+
+
+async def _all(*awaitables: Awaitable[Any]) -> tuple[Any, ...]:
+    """Attend tous les `awaitables` ensemble, résultats dans l'ordre. À la
+    première erreur, les autres sont annulés et l'erreur d'origine est
+    relancée telle quelle (pas d'`ExceptionGroup`) : le run garde ses codes
+    d'échec (`RUN_LEASE_LOST`, `RunFailure`…)."""
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise

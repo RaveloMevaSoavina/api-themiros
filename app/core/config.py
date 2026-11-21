@@ -122,7 +122,12 @@ class Settings(BaseSettings):
     run_layer_b_excerpts_per_question: int = Field(default=6, ge=1, le=10)
     run_layer_b_excerpt_chars: int = Field(default=1200, ge=100, le=4000)
     run_layer_b_max_input_tokens: int = Field(default=80000, ge=1000, le=400000)
-    run_layer_b_timeout_seconds: float = Field(default=120, gt=0, le=600)
+    # Délai d'un appel IA du run (toutes étapes). Un lot de lecture produit
+    # ~5 000 tokens en 90 s environ : 120 s coupait les plus lents, et le
+    # nouvel essai doublait l'attente pour rien.
+    run_layer_b_timeout_seconds: float = Field(default=240, gt=0, le=600)
+    # Appels IA simultanés d'une même étape (lots de lecture, de notation).
+    run_ai_concurrency: int = Field(default=4, ge=1, le=16)
 
     @property
     def cors_origins(self) -> list[str]:
