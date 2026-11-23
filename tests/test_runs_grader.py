@@ -7,6 +7,7 @@ import openai
 import pytest
 
 from app.core.config import Settings
+from app.modules.runs import grader as grader_module
 from app.modules.runs.domain import LayerAResults
 from app.modules.runs.grader import (
     GradingUnavailable,
@@ -149,7 +150,8 @@ async def test_one_structured_call_returns_the_ratings_and_their_cost() -> None:
     request = client.responses.last_request
     assert request["model"] == "test-llm"
     assert request["text_format"] is LlmGradingOutput
-    assert request["temperature"] == 0
+    # Le prompt porte temperature, refusée par le modèle : jamais envoyée.
+    assert "temperature" not in request
     assert request["max_output_tokens"] == 6000
     assert request["input"][0]["content"] == "Noter les sous-questions."
     assert request["input"][1]["content"] == batch.message()
@@ -374,33 +376,102 @@ def test_no_evidence_reader_when_ai_is_disabled() -> None:
     assert build_evidence_reader(_settings()) is not None
 
 
-class RejectingTemperature(FakeResponses):
-    """Refuse `temperature` comme gpt-6-astra, puis répond."""
+async def test_temperature_is_never_sent() -> None:
+    """gpt-6-astra refuse `temperature` (400) : un prompt qui la porte encore
+    ne doit pas faire rejeter toute la couche B."""
+    client = FakeOpenAI(output=OUTPUT)
 
-    def __init__(self, output) -> None:
+    raw, _ = await OpenAISubQuestionGrader(_settings(), client).grade(
+        {**PROMPT, "parameters": {"temperature": 0, "max_tokens": 24000}}, _batch()
+    )
+
+    assert "temperature" not in client.responses.last_request
+    assert raw.grades[0].note == 2
+
+
+@pytest.fixture(autouse=True)
+def no_retry_delay(monkeypatch):
+    monkeypatch.setattr(grader_module, "RETRY_DELAY_SECONDS", 0)
+
+
+class Flaky(FakeResponses):
+    """Échoue avec les erreurs données, dans l'ordre, puis répond."""
+
+    def __init__(self, output, errors: list[Exception]) -> None:
         super().__init__(output=output)
+        self.errors = errors
         self.requests: list[dict] = []
 
     async def parse(self, **kwargs):
         self.requests.append(dict(kwargs))
-        if "temperature" in kwargs:
-            request = httpx.Request("POST", "https://api.openai.test/v1/responses")
-            raise openai.BadRequestError(
-                "Unsupported parameter: 'temperature'",
-                response=httpx.Response(400, request=request),
-                body={"param": "temperature"},
-            )
+        if self.errors:
+            raise self.errors.pop(0)
         return await super().parse(**kwargs)
 
 
-async def test_an_unsupported_temperature_is_dropped_and_the_call_retried() -> None:
+def _http_request():
+    return httpx.Request("POST", "https://api.openai.test/v1/responses")
+
+
+async def test_the_timeout_follows_the_expected_output() -> None:
+    client = FakeOpenAI(output=OUTPUT)
+    settings = _settings(
+        run_ai_timeout_base_seconds=90,
+        run_ai_output_tokens_per_second=25,
+        run_ai_timeout_max_seconds=600,
+    )
+    grader = OpenAISubQuestionGrader(settings, client)
+    batch = _batch()
+
+    await grader.grade(PROMPT, batch)
+
+    assert client.responses.last_request["timeout"] == pytest.approx(
+        90 + batch.max_output_tokens / 25
+    )
+    assert grader.timeout(5000) == 290
+    assert grader.timeout(100_000) == 600
+
+
+async def test_a_timeout_is_not_retried() -> None:
     client = FakeOpenAI()
-    client.responses = RejectingTemperature(OUTPUT)
+    client.responses = Flaky(OUTPUT, [openai.APITimeoutError(_http_request())])
+
+    with pytest.raises(GradingUnavailable) as error:
+        await OpenAISubQuestionGrader(_settings(), client).grade(PROMPT, _batch())
+
+    assert error.value.code == "AI_PROVIDER_UNAVAILABLE"
+    assert "n'a pas répondu" in error.value.message
+    assert len(client.responses.requests) == 1
+
+
+async def test_a_passing_incident_is_retried_once() -> None:
+    client = FakeOpenAI()
+    client.responses = Flaky(
+        OUTPUT,
+        [
+            openai.RateLimitError(
+                "slow down",
+                response=httpx.Response(429, request=_http_request()),
+                body=None,
+            )
+        ],
+    )
 
     raw, _ = await OpenAISubQuestionGrader(_settings(), client).grade(PROMPT, _batch())
 
-    assert [("temperature" in request) for request in client.responses.requests] == [
-        True,
-        False,
-    ]
+    assert len(client.responses.requests) == 2
     assert raw.grades[0].note == 2
+
+
+async def test_a_lasting_incident_gives_up_after_one_retry() -> None:
+    client = FakeOpenAI()
+    client.responses = Flaky(
+        OUTPUT,
+        [openai.APIConnectionError(request=_http_request()) for _ in range(3)],
+    )
+
+    with pytest.raises(GradingUnavailable) as error:
+        await OpenAISubQuestionGrader(_settings(), client).grade(PROMPT, _batch())
+
+    assert error.value.code == "AI_PROVIDER_UNAVAILABLE"
+    assert len(client.responses.requests) == 2

@@ -14,7 +14,7 @@ par défaut, les preuves restent sans lecture, la synthèse garde ses
 libellés factuels ; le run continue.
 """
 
-import logging
+import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
@@ -45,11 +45,10 @@ from app.modules.runs.restitution import (
 MILLION = Decimal("1000000")
 
 
-logger = logging.getLogger(__name__)
-
 # Paramètres d'appel qu'un modèle peut refuser sans que la requête perde son
 # sens : ils sont alors retirés.
-OPTIONAL_PARAMETERS = frozenset({"temperature"})
+RETRY_ATTEMPTS = 2
+RETRY_DELAY_SECONDS = 2.0
 
 
 class GradingUnavailable(Exception):
@@ -216,13 +215,42 @@ def ai_cost(settings: Settings, input_tokens: int, output_tokens: int) -> Decima
 class OpenAIStructuredCall:
     def __init__(self, settings: Settings, client: AsyncOpenAI | None = None) -> None:
         self._settings = settings
-        # Un seul nouvel essai : le run tient un bail, et une IA indisponible
-        # ne fait pas échouer le run.
+        # Pas de nouvel essai du SDK : il relancerait aussi un délai dépassé,
+        # qui échouerait de même. `_send` relance une fois un incident
+        # passager ; le délai est fixé appel par appel (`timeout`).
         self._client = client or AsyncOpenAI(
             api_key=settings.openai_api_key,
-            timeout=settings.run_layer_b_timeout_seconds,
-            max_retries=1,
+            timeout=settings.run_ai_timeout_max_seconds,
+            max_retries=0,
         )
+
+    def timeout(self, estimated_output_tokens: int) -> float:
+        """Délai d'un appel : base + sortie estimée / débit, plafonné."""
+        settings = self._settings
+        return min(
+            settings.run_ai_timeout_max_seconds,
+            settings.run_ai_timeout_base_seconds
+            + estimated_output_tokens / settings.run_ai_output_tokens_per_second,
+        )
+
+    async def _send(self, request: dict[str, Any], seconds: float) -> Any:
+        """Un appel, relancé une fois après un incident passager (connexion,
+        limite de débit, erreur du fournisseur), jamais après un délai
+        dépassé."""
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                return await self._client.responses.parse(**request, timeout=seconds)
+            except openai.APITimeoutError:
+                raise
+            except (
+                openai.APIConnectionError,
+                openai.RateLimitError,
+                openai.InternalServerError,
+            ):
+                if attempt == RETRY_ATTEMPTS - 1:
+                    raise
+                await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+        raise AssertionError("unreachable")
 
     async def _parse[T: BaseModel](
         self,
@@ -257,24 +285,21 @@ class OpenAIStructuredCall:
             "text_format": text_format,
             "max_output_tokens": max_output_tokens,
         }
-        if "temperature" in parameters:
-            request["temperature"] = float(parameters["temperature"])
+        # `temperature` n'est jamais envoyé, même présent dans le prompt :
+        # gpt-6-astra le refuse (400), et grade_sub_questions v1.4 le portait
+        # encore là où la migration qui le retire n'était pas appliquée.
+        # Toute la couche B était alors rejetée (AI_PROVIDER_REJECTED).
+        # Délai selon la sortie attendue du lot, pas le plafond du prompt.
+        timeout = self.timeout(estimated_output_tokens)
 
         try:
-            try:
-                response = await self._client.responses.parse(**request)
-            except openai.BadRequestError as error:
-                # Paramètre facultatif refusé par ce modèle (gpt-6-astra
-                # refuse `temperature`) : l'appel est relancé sans lui plutôt
-                # que de laisser toute l'étape sans IA.
-                if getattr(error, "param", None) not in OPTIONAL_PARAMETERS or (
-                    error.param not in request
-                ):
-                    raise
-                logger.warning("AI parameter %s unsupported, dropped", error.param)
-                request.pop(error.param)
-                response = await self._client.responses.parse(**request)
-        except (openai.APIConnectionError, openai.APITimeoutError) as error:
+            response = await self._send(request, timeout)
+        except openai.APITimeoutError as error:
+            raise GradingUnavailable(
+                "AI_PROVIDER_UNAVAILABLE",
+                f"Le fournisseur IA n'a pas répondu en {timeout:.0f} s",
+            ) from error
+        except openai.APIConnectionError as error:
             raise GradingUnavailable(
                 "AI_PROVIDER_UNAVAILABLE", "Connexion au fournisseur IA impossible"
             ) from error

@@ -49,7 +49,7 @@ from app.modules.runs.domain import LayerAResults, PillarScore, VariableResult
 from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.project import ProjectContext
 
-READING_VERSION = "reading/1.0.0"
+READING_VERSION = "reading/1.1.0"
 PROMPT_CODE = "read_evidences"
 PROMPT_VERSION = "v1.0"
 
@@ -81,7 +81,10 @@ class ReadingRules:
     evidences_per_variable: int = 3
     excerpt_chars: int = 600
     max_input_tokens: int = 30000
-    max_output_tokens: int = 16000
+    # Sortie estimée d'un lot. 16 000 donnait 9 lots d'environ 5 600 tokens
+    # réels, coupés au-delà de 240 s ; 8 000 en fait deux fois plus, deux
+    # fois plus courts, lancés ensemble (`run_ai_concurrency`).
+    max_output_tokens: int = 8000
 
     def as_dict(self) -> dict[str, Any]:
         return {"engine_version": READING_VERSION, **asdict(self)}

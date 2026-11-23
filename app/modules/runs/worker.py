@@ -427,6 +427,7 @@ class RunWorker:
                     answer.message,
                 )
                 ai["errors"].append(answer.code)
+                ai.setdefault("messages", []).append(answer.message[:300])
                 continue
             raw, usage = answer
             usages.append(usage)
@@ -485,21 +486,28 @@ class RunWorker:
 
         infirmed: set = set()
         usages: list[AiUsage] = []
-        for index, batch in enumerate(batches):
-            if index:
-                # Prolonge le bail entre deux appels.
-                await self._repository.step(run, "layer_c", "running")
-            try:
-                raw, usage = await self._qualifier.qualify(prompt, batch)
-            except GradingUnavailable as error:
+        qualifier = self._qualifier
+        # Un appel peut dépasser le bail (délai selon la taille du lot) : le
+        # bail est prolongé en fond, et les lots partent ensemble.
+        async with self._keep_lease(run, "layer_c"):
+            answers = await self._concurrently(
+                [
+                    lambda batch=batch: qualifier.qualify(prompt, batch)
+                    for batch in batches
+                ]
+            )
+        for batch, answer in zip(batches, answers, strict=True):
+            if isinstance(answer, GradingUnavailable):
                 logger.warning(
                     "Run %s: layer C qualification unavailable (%s: %s)",
                     run.run_id,
-                    error.code,
-                    error.message,
+                    answer.code,
+                    answer.message,
                 )
-                ai["errors"].append(error.code)
+                ai["errors"].append(answer.code)
+                ai.setdefault("messages", []).append(answer.message[:300])
                 continue
+            raw, usage = answer
             usages.append(usage)
             infirmed |= interpret_alerts(batch, raw, rules)
 
@@ -573,6 +581,7 @@ class RunWorker:
                     answer.message,
                 )
                 ai["errors"].append(answer.code)
+                ai.setdefault("messages", []).append(answer.message[:300])
                 continue
             raw, usage = answer
             usages.append(usage)
@@ -636,6 +645,7 @@ class RunWorker:
                     answer.message,
                 )
                 ai["errors"].append(answer.code)
+                ai.setdefault("messages", []).append(answer.message[:300])
                 continue
             raw, usage = answer
             usages.append(usage)

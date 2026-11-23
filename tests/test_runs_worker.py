@@ -168,7 +168,7 @@ async def test_empty_queue_does_nothing() -> None:
     assert repository.claims == [
         (
             "host-1#runs",
-            "layer-a/1.0.0+layer-b/1.5.0+layer-c/1.2.0+reading/1.0.0+restitution/1.7.0",
+            "layer-a/1.0.0+layer-b/1.5.0+layer-c/1.2.0+reading/1.1.0+restitution/1.7.0",
         )
     ]
 
@@ -862,7 +862,7 @@ async def test_every_segment_variable_and_pillar_is_read_in_a_single_ai_call() -
     (score,) = results["scores"]
     assert score["interpretation"].startswith("Le projet gère ses finances⟦1⟧.")
     rules = results["rules"]["reading"]
-    assert rules["engine_version"] == "reading/1.0.0"
+    assert rules["engine_version"] == "reading/1.1.0"
     assert rules["ai"]["prompt"] == "read_evidences_v1.0"
     assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
     assert rules["summary"] == {
