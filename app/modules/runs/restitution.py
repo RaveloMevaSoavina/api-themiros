@@ -19,10 +19,14 @@ Déroulé, pour un run :
    candidat sans preuve n'est pas retenu (GF-1). Les origines des actions
    sont les faiblesses, les alertes et les critères non conclus documentés
    en partie ;
-2. `build_batch` : tous les candidats en un seul appel IA (prompt
-   formulate_restitution), extraits dédoublonnés et découpés en phrases,
-   identifiants courts (P1, W1, V1, N1, E1). Le volume est borné par
-   construction (neuf puces, six actions) : jamais plus d'un appel ;
+2. `build_batches` : des appels IA parallèles (prompt
+   formulate_restitution) : un pour la synthèse (constats et conclusion),
+   puis un par groupe de `actions_per_call` actions. Un seul appel de
+   ~22 000 tokens de sortie (fr + en) fixait la durée de l'étape ; découpé,
+   elle suit l'appel le plus long. Chaque appel reçoit seulement ses
+   candidats et leurs extraits, dédoublonnés et découpés en phrases,
+   identifiants courts (P1, W1, V1, N1, E1). `build_batch` garde tout en un
+   appel ;
 3. `interpret` : l'IA rédige chaque constat en paragraphe, la conclusion
    prudente et chaque action avec ses trois projections persona (l'action
    et sa raison, un paragraphe), en citant dans le texte les phrases des
@@ -69,21 +73,26 @@ from app.modules.runs.layer_b import LayerBResults, truncate
 from app.modules.runs.layer_c import Alert, LayerCInputs, ordered_segments
 from app.modules.runs.project import ProjectContext
 
-RESTITUTION_VERSION = "restitution/1.6.0"
+RESTITUTION_VERSION = "restitution/1.7.0"
 PROMPT_CODE = "formulate_restitution"
 # v1.2 : le même appel traduit aussi la restitution dans les autres langues
 # de l'interface (`tr`). v1.3 : extraits en phrases, sources citées dans le
 # texte, interprétation de chaque extrait (`x`). v1.4 : le projet évalué
 # (`pj`), sujet de tous les textes ; interprétations sourcées. v1.5 :
 # constats et raisons des actions en paragraphes ; les extraits sont lus
-# par l'étape de lecture.
-PROMPT_VERSION = "v1.5"
+# par l'étape de lecture. v1.6 : `m` dit quoi rédiger (synthèse ou actions),
+# pour des appels parallèles.
+PROMPT_VERSION = "v1.6"
 
 Section = Literal["progres", "faiblesse", "a_verifier"]
 # Rédaction de la synthèse : faite, inutile (aucun constat), IA désactivée,
 # ou en échec (prompt introuvable, erreur, réponse inexploitable).
 Status = Literal["completed", "not_needed", "disabled", "failed"]
 OriginType = Literal["pillar", "criterion", "alert"]
+# Ce qu'un appel rédige : tout, la synthèse (constats et conclusion) ou des
+# actions ; clé `m` du message (absente pour « all »).
+Mode = Literal["all", "synthesis", "actions"]
+MODE_KEYS = {"synthesis": "s", "actions": "a"}
 PERSONAS = ("decideur", "pmu", "analyste")
 # Clés courtes des personas dans la réponse de l'IA.
 PERSONA_KEYS = {"decideur": "dec", "pmu": "pmu", "analyste": "ana"}
@@ -127,6 +136,9 @@ class RestitutionRules:
     # Assez de phrases pour que l'IA cite la bonne.
     excerpt_chars: int = 600
     max_actions: int = 6
+    # Actions par appel de rédaction, en parallèle de la synthèse : deux
+    # actions (~5 200 tokens en fr + en) pèsent autant que la synthèse.
+    actions_per_call: int = 2
 
     def as_dict(self) -> dict[str, Any]:
         return {"engine_version": RESTITUTION_VERSION, **asdict(self)}
@@ -249,8 +261,13 @@ class RestitutionBatch:
     origins: tuple[str, ...] = ()
     # Langues de traduction demandées (`tr`), hors langue de rédaction.
     locales: tuple[str, ...] = ()
+    mode: Mode = "all"
     estimated_input_tokens: int = 0
     max_output_tokens: int = 0
+
+    @property
+    def writes_synthesis(self) -> bool:
+        return self.mode != "actions"
 
     def message(self) -> str:
         return json.dumps(self.content, ensure_ascii=False, separators=(",", ":"))
@@ -664,29 +681,98 @@ def build_batch(
     rules: RestitutionRules,
     project: ProjectContext | None = None,
 ) -> RestitutionBatch | None:
-    """L'appel IA, ou `None` quand il n'y a rien à rédiger."""
+    """Tout en un appel IA, ou `None` quand il n'y a rien à rédiger."""
     if not restitution.findings:
         return None
+    return _batch(
+        locale,
+        restitution,
+        restitution.findings,
+        _origins(restitution, rules),
+        "all",
+        texts,
+        rules,
+        project,
+    )
+
+
+def build_batches(
+    locale: str,
+    restitution: Restitution,
+    texts: Mapping[UUID, str],
+    rules: RestitutionRules,
+    project: ProjectContext | None = None,
+) -> list[RestitutionBatch]:
+    """Appels IA parallèles : la synthèse d'abord (tous les candidats, pour
+    la conclusion), puis les actions par groupes de `actions_per_call`,
+    chacun avec ses seules origines. Aucun appel s'il n'y a rien à
+    rédiger."""
+    if not restitution.findings:
+        return []
+    batches = [
+        _batch(
+            locale,
+            restitution,
+            restitution.findings,
+            (),
+            "synthesis",
+            texts,
+            rules,
+            project,
+        )
+    ]
+    origins = _origins(restitution, rules)
+    by_key = {finding.key: finding for finding in restitution.findings}
+    size = max(1, rules.actions_per_call)
+    for start in range(0, len(origins), size):
+        group = origins[start : start + size]
+        batches.append(
+            _batch(
+                locale,
+                restitution,
+                [by_key[key] for key in group],
+                group,
+                "actions",
+                texts,
+                rules,
+                project,
+            )
+        )
+    return batches
+
+
+def _origins(restitution: Restitution, rules: RestitutionRules) -> tuple[str, ...]:
+    return tuple(finding.key for finding in restitution.origins())[: rules.max_actions]
+
+
+def _batch(
+    locale: str,
+    restitution: Restitution,
+    findings: list[Finding],
+    origins: tuple[str, ...],
+    mode: Mode,
+    texts: Mapping[UUID, str],
+    rules: RestitutionRules,
+    project: ProjectContext | None,
+) -> RestitutionBatch:
     limits = restitution.limits
     targets = tuple(other for other in INTERFACE_LOCALES if other != locale)
-    header: dict[str, Any] = {"lang": locale}
+    content: dict[str, Any] = {"lang": locale}
     if project is not None and (context := project.prompt()):
-        header["pj"] = context
-    batch = RestitutionBatch(
-        locales=targets,
-        content={
-            **header,
-            "l": {
-                "nc": limits.not_concluded,
-                "tc": limits.criteria,
-                "cf": limits.confidence,
-                "ld": limits.leads,
-            },
-            "x": {},
-        },
-    )
+        content["pj"] = context
+    if mode in MODE_KEYS:
+        content["m"] = MODE_KEYS[mode]
+    if mode != "actions":
+        content["l"] = {
+            "nc": limits.not_concluded,
+            "tc": limits.criteria,
+            "cf": limits.confidence,
+            "ld": limits.leads,
+        }
+    content["x"] = {}
+    batch = RestitutionBatch(locales=targets, content=content, mode=mode)
     key_of_segment: dict[UUID, str] = {}
-    for finding in restitution.findings:
+    for finding in findings:
         keys: list[str] = []
         for segment_id in finding.segment_ids:
             if segment_id not in texts:
@@ -709,22 +795,24 @@ def build_batch(
         batch.content.setdefault(group, []).append(
             {"k": finding.key, **finding.facts, "e": keys}
         )
-    batch.origins = tuple(finding.key for finding in restitution.origins())[
-        : rules.max_actions
-    ]
+    batch.origins = origins
     if batch.origins:
         batch.content["o"] = list(batch.origins)
     if targets:
         batch.content["tr"] = list(targets)
-    items = sum(finding.section is not None for finding in restitution.findings)
+    synthesis = (
+        OUTPUT_TOKENS_CONCLUSION
+        + OUTPUT_TOKENS_PER_ITEM
+        * sum(finding.section is not None for finding in findings)
+        if batch.writes_synthesis
+        else 0
+    )
     batch.estimated_input_tokens = SYSTEM_PROMPT_TOKENS + (
         len(batch.message()) // CHARS_PER_TOKEN
     )
     # Chaque traduction réécrit constats, conclusion et actions.
     batch.max_output_tokens = (1 + len(targets)) * (
-        OUTPUT_TOKENS_CONCLUSION
-        + OUTPUT_TOKENS_PER_ITEM * items
-        + OUTPUT_TOKENS_PER_ACTION * len(batch.origins)
+        synthesis + OUTPUT_TOKENS_PER_ACTION * len(batch.origins)
     )
     return batch
 
@@ -809,7 +897,11 @@ def interpret(
     Traductions : seules les langues demandées comptent, et seulement pour
     ce qui a été rédigé dans la langue du run. Une action n'est traduite
     qu'avec ses trois projections ; ce qui manque s'affiche dans la langue
-    du run."""
+    du run.
+
+    Appels parallèles : chaque lot n'applique que ce qu'il rédige (`mode`) ;
+    la synthèse rend la restitution qualifiée, les actions s'ajoutent à
+    celles des autres lots. Interpréter la synthèse avant les actions."""
     translations = {
         locale: raw.translations[locale]
         for locale in batch.locales
@@ -817,71 +909,74 @@ def interpret(
     }
     # Phrases citées par extrait, pour la lecture des preuves.
     spans: dict[str, list[Span]] = {}
-    seen: set[str] = set()
-    for item in raw.items:
-        finding = batch.findings.get(item.key)
-        if finding is None or finding.section is None or item.key in seen:
-            continue
-        seen.add(item.key)
-        allowed = batch.allowed.get(item.key, frozenset())
-        citations = Citations(batch.excerpts)
-        text = _written(item.text, citations, allowed, ITEM_CHARS)
-        if text and long_enough(text, ITEM_MIN_CHARS):
-            translated = {
-                locale: _written(
-                    translation.items.get(item.key), citations, allowed, ITEM_CHARS
+    if batch.writes_synthesis:
+        seen: set[str] = set()
+        for item in raw.items:
+            finding = batch.findings.get(item.key)
+            if finding is None or finding.section is None or item.key in seen:
+                continue
+            seen.add(item.key)
+            allowed = batch.allowed.get(item.key, frozenset())
+            citations = Citations(batch.excerpts)
+            text = _written(item.text, citations, allowed, ITEM_CHARS)
+            if text and long_enough(text, ITEM_MIN_CHARS):
+                translated = {
+                    locale: _written(
+                        translation.items.get(item.key), citations, allowed, ITEM_CHARS
+                    )
+                    for locale, translation in translations.items()
+                }
+                locales = [
+                    locale
+                    for locale, value in translated.items()
+                    if long_enough(value, ITEM_MIN_CHARS)
+                ]
+                texts, finding.citations = compact(
+                    [text, *(translated[locale] for locale in locales)],
+                    citations.sources,
                 )
+                finding.text = fit(texts[0] or "", ITEM_MAX_CHARS)
+                for locale, value in zip(locales, texts[1:], strict=True):
+                    finding.translations[locale] = fit(value or "", ITEM_MAX_CHARS)
+            found = _cited(
+                batch, item.key, [*item.excerpts, *references(item.text)], spans
+            )
+            if found:
+                finding.segment_ids = found
+
+        # Conclusion en paragraphes : `_narrative` garde les lignes vides.
+        citations = Citations(batch.excerpts)
+
+        def narrative(text: str | None) -> str | None:
+            if not text or not text.strip():
+                return None
+            return _narrative(citations.cite(text), CONCLUSION_CHARS) or None
+
+        conclusion = narrative(raw.conclusion)
+        if conclusion:
+            translated = {
+                locale: narrative(translation.conclusion)
                 for locale, translation in translations.items()
             }
-            locales = [
-                locale
-                for locale, value in translated.items()
-                if long_enough(value, ITEM_MIN_CHARS)
-            ]
-            texts, finding.citations = compact(
-                [text, *(translated[locale] for locale in locales)],
+            locales = [locale for locale, value in translated.items() if value]
+            texts, restitution.conclusion_citations = compact(
+                [conclusion, *(translated[locale] for locale in locales)],
                 citations.sources,
             )
-            finding.text = fit(texts[0] or "", ITEM_MAX_CHARS)
+            restitution.conclusion = fit(texts[0] or "", CONCLUSION_MAX_CHARS)
             for locale, value in zip(locales, texts[1:], strict=True):
-                finding.translations[locale] = fit(value or "", ITEM_MAX_CHARS)
-        found = _cited(batch, item.key, [*item.excerpts, *references(item.text)], spans)
-        if found:
-            finding.segment_ids = found
-
-    # Conclusion en paragraphes : `_narrative` garde les lignes vides.
-    citations = Citations(batch.excerpts)
-
-    def narrative(text: str | None) -> str | None:
-        if not text or not text.strip():
-            return None
-        return _narrative(citations.cite(text), CONCLUSION_CHARS) or None
-
-    conclusion = narrative(raw.conclusion)
-    if conclusion:
-        translated = {
-            locale: narrative(translation.conclusion)
-            for locale, translation in translations.items()
-        }
-        locales = [locale for locale, value in translated.items() if value]
-        texts, restitution.conclusion_citations = compact(
-            [conclusion, *(translated[locale] for locale in locales)],
-            citations.sources,
-        )
-        restitution.conclusion = fit(texts[0] or "", CONCLUSION_MAX_CHARS)
-        for locale, value in zip(locales, texts[1:], strict=True):
-            restitution.conclusion_translations[locale] = fit(
-                value or "", CONCLUSION_MAX_CHARS
-            )
-        for source in restitution.conclusion_citations:
-            key = next(
-                key
-                for key, item in batch.excerpts.items()
-                if item.segment_id == source.segment_id
-            )
-            spans.setdefault(key, []).extend(source.spans)
-    else:
-        restitution.conclusion = None
+                restitution.conclusion_translations[locale] = fit(
+                    value or "", CONCLUSION_MAX_CHARS
+                )
+            for source in restitution.conclusion_citations:
+                key = next(
+                    key
+                    for key, item in batch.excerpts.items()
+                    if item.segment_id == source.segment_id
+                )
+                spans.setdefault(key, []).extend(source.spans)
+        else:
+            restitution.conclusion = None
 
     actions: dict[str, Action] = {}
     for raw_action in raw.actions:
@@ -970,6 +1065,15 @@ def interpret(
             or finding.segment_ids,
             projections=projections,
         )
-    restitution.actions = [actions[key] for key in batch.origins if key in actions]
+    # Les actions de plusieurs appels se rejoignent dans l'ordre du plan.
+    merged = {action.finding.key: action for action in restitution.actions}
+    for key, action in actions.items():
+        merged.setdefault(key, action)
+    restitution.actions = [
+        merged[finding.key]
+        for finding in restitution.origins()
+        if finding.key in merged
+    ]
 
-    restitution.qualified = True
+    if batch.writes_synthesis:
+        restitution.qualified = True

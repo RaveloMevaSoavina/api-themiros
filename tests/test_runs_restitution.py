@@ -18,6 +18,7 @@ from app.modules.runs.restitution import (
     RawTranslation,
     RestitutionRules,
     build_batch,
+    build_batches,
     interpret,
     select,
 )
@@ -339,6 +340,83 @@ def test_nothing_to_write_means_no_ai_call() -> None:
     restitution = select(_inputs(), _layer_a(_score(BUDGET, V2, 85)), None, [], RULES)
 
     assert build_batch("fr", restitution, {}, RULES) is None
+
+
+def _all_texts(text: str) -> dict:
+    segments = (BUDGET_SEGMENT, SUIVI_SEGMENT, PERTINENCE_SEGMENT, IMPACT_SEGMENT)
+    return {segment: text for segment in segments}
+
+
+def test_synthesis_and_action_groups_go_in_parallel_calls() -> None:
+    restitution, _, _ = _full_restitution()
+    texts = _all_texts("Le taux d'exécution budgétaire atteint 85 %. " * 20)
+    whole = build_batch("fr", restitution, texts, RULES)
+
+    synthesis, *groups = build_batches("fr", restitution, texts, RULES)
+
+    # La synthèse voit tous les candidats, mais ne propose aucune action.
+    assert synthesis.mode == "synthesis" and synthesis.content["m"] == "s"
+    assert "o" not in synthesis.content and synthesis.origins == ()
+    assert synthesis.content["l"] == whole.content["l"]
+    assert set(synthesis.findings) == {"P1", "W1", "W2", "V1", "N1"}
+    # Les actions par deux, avec leurs seuls constats et leurs extraits.
+    assert [group.origins for group in groups] == [("W1", "W2"), ("V1", "N1")]
+    for group in groups:
+        assert group.mode == "actions" and group.content["m"] == "a"
+        assert "l" not in group.content
+        assert set(group.findings) == set(group.origins)
+        assert group.content["o"] == list(group.origins)
+        cited = {key for keys in group.allowed.values() for key in keys}
+        assert set(group.content["x"]) == cited
+    # Le découpage ne réécrit rien : même volume de sortie qu'un seul appel.
+    assert (
+        synthesis.max_output_tokens + sum(group.max_output_tokens for group in groups)
+        == whole.max_output_tokens
+    )
+
+
+def test_nothing_to_write_means_no_parallel_call() -> None:
+    restitution = select(_inputs(), _layer_a(_score(BUDGET, V2, 85)), None, [], RULES)
+
+    assert build_batches("fr", restitution, {}, RULES) == []
+
+
+def test_parallel_answers_merge_in_plan_order() -> None:
+    restitution, _, _ = _full_restitution()
+    texts = _all_texts("Les besoins ne sont pas analysés.")
+    synthesis, first, second = build_batches("fr", restitution, texts, RULES)
+
+    def actions(batch):
+        return RawRestitution(
+            items=(),
+            conclusion="",
+            actions=tuple(
+                RawAction(key, tuple(batch.allowed[key])[:1], _projections())
+                for key in batch.origins
+            ),
+        )
+
+    interpret(
+        restitution,
+        synthesis,
+        RawRestitution(
+            items=(RawItem("W1", "Le projet n'analyse pas ses besoins." + PAD, ()),),
+            conclusion="Les résultats suggèrent une pertinence à étayer.",
+            actions=(RawAction("W1", (), _projections()),),
+        ),
+    )
+    # La synthèse ne rédige pas d'action, même si l'IA en renvoie.
+    assert restitution.actions == [] and restitution.qualified is True
+    interpret(restitution, second, actions(second))
+    interpret(restitution, first, actions(first))
+
+    assert [action.finding.key for action in restitution.actions] == [
+        "W1",
+        "W2",
+        "V1",
+        "N1",
+    ]
+    assert restitution.conclusion.startswith("Les résultats suggèrent")
 
 
 def _projections(reason: str = "le critère est faiblement étayé" + PAD):

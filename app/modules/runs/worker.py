@@ -87,7 +87,7 @@ from app.modules.runs.restitution import (
     RestitutionRules,
     select,
 )
-from app.modules.runs.restitution import build_batch as build_restitution_batch
+from app.modules.runs.restitution import build_batches as build_restitution_batches
 from app.modules.runs.restitution import interpret as interpret_restitution
 from app.modules.usage.ledger import UsageLedger
 
@@ -614,25 +614,35 @@ class RunWorker:
             }
             return restitution
 
-        batch = build_restitution_batch(
+        # Synthèse et groupes d'actions rédigés en parallèle : l'étape dure
+        # autant que l'appel le plus long, pas que leur somme.
+        batches = build_restitution_batches(
             inputs.locale, restitution, texts, rules, inputs.project
         )
-        assert batch is not None
+        ai["batches"] = len(batches)
+        writer = self._writer
         usages: list[AiUsage] = []
-        try:
-            raw, usage = await self._writer.write(prompt, batch)
-        except GradingUnavailable as error:
-            logger.warning(
-                "Run %s: restitution writing unavailable (%s: %s)",
-                run.run_id,
-                error.code,
-                error.message,
-            )
-            ai["errors"].append(error.code)
-        else:
+        answers = await self._concurrently(
+            [lambda batch=batch: writer.write(prompt, batch) for batch in batches]
+        )
+        # Synthèse d'abord : les actions s'appuient sur ses constats.
+        for batch, answer in zip(batches, answers, strict=True):
+            if isinstance(answer, GradingUnavailable):
+                logger.warning(
+                    "Run %s: restitution writing unavailable (%s, %s: %s)",
+                    run.run_id,
+                    batch.mode,
+                    answer.code,
+                    answer.message,
+                )
+                ai["errors"].append(answer.code)
+                continue
+            raw, usage = answer
             usages.append(usage)
             interpret_restitution(restitution, batch, raw)
-        restitution.ai = await self._account(run, "restitution", ai, usages, 1)
+        restitution.ai = await self._account(
+            run, "restitution", ai, usages, len(batches)
+        )
         return restitution
 
     async def _concurrently[T](

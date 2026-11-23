@@ -168,7 +168,7 @@ async def test_empty_queue_does_nothing() -> None:
     assert repository.claims == [
         (
             "host-1#runs",
-            "layer-a/1.0.0+layer-b/1.5.0+layer-c/1.2.0+reading/1.0.0+restitution/1.6.0",
+            "layer-a/1.0.0+layer-b/1.5.0+layer-c/1.2.0+reading/1.0.0+restitution/1.7.0",
         )
     ]
 
@@ -600,13 +600,17 @@ async def test_no_ai_call_when_the_layers_agree() -> None:
 
 
 class FakeWriter:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(
+        self, error: Exception | None = None, failing_mode: str | None = None
+    ) -> None:
         self.error = error
+        # Seuls les appels de ce mode échouent (tous si None).
+        self.failing_mode = failing_mode
         self.batches: list = []
 
     async def write(self, prompt, batch):
         self.batches.append(batch)
-        if self.error:
+        if self.error and self.failing_mode in (None, batch.mode):
             raise self.error
         projections = {
             persona: RawProjection(
@@ -623,9 +627,11 @@ class FakeWriter:
                         tuple(batch.allowed[key])[:1],
                     )
                     for key, finding in batch.findings.items()
-                    if finding.section is not None
+                    if finding.section is not None and batch.writes_synthesis
                 ),
-                conclusion="Les résultats suggèrent une pertinence à étayer.",
+                conclusion="Les résultats suggèrent une pertinence à étayer."
+                if batch.writes_synthesis
+                else "",
                 actions=tuple(
                     RawAction(key, tuple(batch.allowed[key])[:1], projections)
                     for key in batch.origins
@@ -647,14 +653,19 @@ def _restitution_worker(repository, writer) -> RunWorker:
     )
 
 
-async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
+async def test_the_restitution_is_written_in_parallel_ai_calls() -> None:
     repository = _layer_c_repository()
     writer = FakeWriter()
 
     await _restitution_worker(repository, writer).run_once()
 
-    assert len(writer.batches) == 1
-    assert writer.batches[0].content["pj"]["n"] == "Résilience Sahel"
+    # La synthèse, puis les deux actions (W1, V1) dans un même appel.
+    assert [batch.mode for batch in writer.batches] == ["synthesis", "actions"]
+    assert [batch.content.get("m") for batch in writer.batches] == ["s", "a"]
+    assert writer.batches[1].origins == ("W1", "V1")
+    assert all(
+        batch.content["pj"]["n"] == "Résilience Sahel" for batch in writer.batches
+    )
     (results,) = repository.completed
     restitution = results["restitution"]
     # Pertinence (note 1) est une faiblesse ; l'alerte ALERT-01 est à vérifier.
@@ -672,9 +683,10 @@ async def test_the_restitution_is_written_in_a_single_ai_call() -> None:
     ]
     assert all(len(action["projections"]) == 3 for action in restitution["actions"])
     rules = results["rules"]["restitution"]
-    assert rules["engine_version"] == "restitution/1.6.0"
-    assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 1
-    assert rules["ai"]["prompt"] == "formulate_restitution_v1.5"
+    assert rules["engine_version"] == "restitution/1.7.0"
+    assert rules["ai"]["status"] == "completed" and rules["ai"]["calls"] == 2
+    assert rules["ai"]["batches"] == 2
+    assert rules["ai"]["prompt"] == "formulate_restitution_v1.6"
     assert results["summary"]["actions"] == 2
     assert repository.failures == []
 
@@ -714,8 +726,28 @@ async def test_a_writing_failure_does_not_fail_the_run() -> None:
     assert results["restitution"]["synthesis"]["qualified"] is False
     assert results["restitution"]["synthesis"]["status"] == "failed"
     assert results["restitution"]["actions"] == []
-    assert results["rules"]["restitution"]["ai"]["errors"] == ["AI_OUTPUT_TRUNCATED"]
+    assert results["rules"]["restitution"]["ai"]["errors"] == [
+        "AI_OUTPUT_TRUNCATED",
+        "AI_OUTPUT_TRUNCATED",
+    ]
     assert repository.failures == []
+
+
+async def test_failed_actions_keep_the_written_synthesis() -> None:
+    repository = _layer_c_repository()
+    writer = FakeWriter(
+        GradingUnavailable("AI_OUTPUT_TRUNCATED", "cut"), failing_mode="actions"
+    )
+
+    await _restitution_worker(repository, writer).run_once()
+
+    (results,) = repository.completed
+    synthesis = results["restitution"]["synthesis"]
+    assert synthesis["qualified"] is True and synthesis["status"] == "completed"
+    assert synthesis["conclusion"].startswith("Les résultats")
+    assert results["restitution"]["actions"] == []
+    ai = results["rules"]["restitution"]["ai"]
+    assert ai["status"] == "partial" and ai["errors"] == ["AI_OUTPUT_TRUNCATED"]
 
 
 async def test_an_empty_restitution_needs_no_ai_call() -> None:

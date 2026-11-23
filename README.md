@@ -94,11 +94,13 @@ default severity and message (`qualified = false`).
 The restitution (`restitution.py`) selects up to three progress points,
 weaknesses and areas to verify, plus the action origins, with deterministic
 rules; weaknesses are relative (the weakest pillars below 80/100 and criteria
-below 2.4/3). A single `formulate_restitution` call (prompt v1.2) writes the
-findings, a cautious narrative conclusion (two or three paragraphs) and each
-action worded for the three personas, in one or two full sentences with
-their reason. The same call also translates the findings, the
-conclusion and the actions into the other interface languages (fr, en),
+below 2.4/3). Parallel `formulate_restitution` calls (prompt v1.6) write
+it: one call writes the findings and a cautious narrative conclusion (two or
+three paragraphs), and the actions are written two per call
+(`actions_per_call`), each worded for the three personas, in one or two full
+sentences with their reason. The step lasts as long as the slowest call
+rather than one ~22k-token call. Each call also translates what it wrote
+into the other interface languages (fr, en),
 stored in `translations` columns; the dashboard and exports fall back to the
 run's language when a translation is missing. Without
 AI, findings keep a factual label, with no conclusion and no action plan; the
