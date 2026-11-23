@@ -285,10 +285,6 @@ class OpenAIStructuredCall:
             "text_format": text_format,
             "max_output_tokens": max_output_tokens,
         }
-        # `temperature` n'est jamais envoyé, même présent dans le prompt :
-        # gpt-6-astra le refuse (400), et grade_sub_questions v1.4 le portait
-        # encore là où la migration qui le retire n'était pas appliquée.
-        # Toute la couche B était alors rejetée (AI_PROVIDER_REJECTED).
         # Délai selon la sortie attendue du lot, pas le plafond du prompt.
         timeout = self.timeout(estimated_output_tokens)
 

@@ -88,7 +88,7 @@ def context() -> PillarGenerationContext:
             version="v1.0",
             template="Generate structured pillars",
             model="gpt-6-astra",
-            parameters={"temperature": 0.3, "max_tokens": 4000},
+            parameters={"max_tokens": 4000},
         ),
     )
 

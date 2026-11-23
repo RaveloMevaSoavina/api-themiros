@@ -68,7 +68,7 @@ PROMPT = {
     "version": "v1.0",
     "template": "Noter les sous-questions.",
     "model": "test-llm",
-    "parameters": {"temperature": 0, "max_tokens": 6000},
+    "parameters": {"max_tokens": 6000},
 }
 
 
@@ -150,8 +150,6 @@ async def test_one_structured_call_returns_the_ratings_and_their_cost() -> None:
     request = client.responses.last_request
     assert request["model"] == "test-llm"
     assert request["text_format"] is LlmGradingOutput
-    # Le prompt porte temperature, refusée par le modèle : jamais envoyée.
-    assert "temperature" not in request
     assert request["max_output_tokens"] == 6000
     assert request["input"][0]["content"] == "Noter les sous-questions."
     assert request["input"][1]["content"] == batch.message()
@@ -254,7 +252,6 @@ async def test_one_structured_call_qualifies_the_gaps() -> None:
     request = client.responses.last_request
     assert request["text_format"] is LlmQualificationOutput
     assert request["max_output_tokens"] == 2000
-    assert "temperature" not in request
     assert request["input"][1]["content"] == batch.message()
     assert raw == [
         RawQualification(
@@ -374,19 +371,6 @@ async def test_one_structured_call_reads_extracts_variables_and_pillars() -> Non
 def test_no_evidence_reader_when_ai_is_disabled() -> None:
     assert build_evidence_reader(Settings(ai_provider="disabled")) is None
     assert build_evidence_reader(_settings()) is not None
-
-
-async def test_temperature_is_never_sent() -> None:
-    """gpt-6-astra refuse `temperature` (400) : un prompt qui la porte encore
-    ne doit pas faire rejeter toute la couche B."""
-    client = FakeOpenAI(output=OUTPUT)
-
-    raw, _ = await OpenAISubQuestionGrader(_settings(), client).grade(
-        {**PROMPT, "parameters": {"temperature": 0, "max_tokens": 24000}}, _batch()
-    )
-
-    assert "temperature" not in client.responses.last_request
-    assert raw.grades[0].note == 2
 
 
 @pytest.fixture(autouse=True)

@@ -119,8 +119,6 @@ class OpenAIPillarGenerator:
             "text_format": LlmPillarOutput,
             "max_output_tokens": int(parameters.get("max_tokens", 4000)),
         }
-        if "temperature" in parameters:
-            request_options["temperature"] = float(parameters["temperature"])
 
         try:
             response = await self._client.responses.parse(**request_options)
