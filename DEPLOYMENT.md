@@ -80,6 +80,46 @@ nouveau déploiement du frontend :
 VITE_API_URL=https://api.evoranq.com
 ```
 
+## Facturation Stripe
+
+La page Facturation du dashboard (administrateurs de l'organisation) lit
+l'offre, le quota et les factures en base ; la souscription en ligne passe par
+Stripe Checkout, la gestion du paiement par le portail client Stripe, et le
+webhook recopie abonnements et factures (migration
+`20261124000001_stripe_billing.sql`).
+
+1. **Clés** dans `.env.production` : `STRIPE_SECRET_KEY` (clé secrète ou
+   restreinte), `DASHBOARD_URL=https://app.themiros.com`, mentions
+   `BILLING_SELLER_*` des factures manuelles. Redémarrer l'API.
+2. **Produits et prix** : `docker compose --env-file .env.production exec api
+   python -m app.modules.billing.bootstrap` (idempotent ; crée les prix
+   annuels `themiros_essential_annual` et `themiros_professional_annual`).
+3. **Tableau de bord Stripe** :
+   - Stripe Tax activé, enregistrement TVA France ; origine = siège social.
+   - Paramètres › Factures : préfixe `THS` (la série `TH-AAAA-NNNN` reste aux
+     factures manuelles du backoffice).
+   - Moyens de paiement : carte et prélèvement SEPA.
+   - Portail client : mise à jour du moyen de paiement, historique des
+     factures, adresse et numéro de TVA, résiliation **en fin de période** ;
+     changement d'offre désactivé (il passe par l'équipe).
+4. **Webhook** : point d'entrée `https://api.evoranq.com/api/v1/billing/webhook`,
+   même version d'API que `STRIPE_API_VERSION`, événements
+   `checkout.session.completed`, `customer.subscription.created|updated|deleted`,
+   `invoice.finalized|paid|payment_failed|voided|marked_uncollectible`,
+   `customer.updated`. Copier le secret de signature dans
+   `STRIPE_WEBHOOK_SECRET` et redémarrer l'API.
+5. **Dashboard** : `VITE_BILLING_ENABLED=true`, puis redéployer le frontend.
+   Backoffice : `VITE_STRIPE_DASHBOARD_URL=https://dashboard.stripe.com`.
+
+En local : clés de test, puis
+`stripe listen --forward-to localhost:8000/api/v1/billing/webhook` (le secret
+`whsec_…` affiché va dans `STRIPE_WEBHOOK_SECRET`). Carte `4242 4242 4242 4242`
+pour un paiement réussi, `4000 0000 0000 0341` pour un échec au
+renouvellement ; les horloges de test Stripe simulent le renouvellement annuel.
+
+Les événements reçus sont journalisés dans `stripe_events` : `error` non vide
+= échec, que Stripe renvoie pendant trois jours.
+
 ## Worker d'ingestion documentaire
 
 `deploy/deploy.sh` démarre aussi le service `ingestion-worker`, construit à

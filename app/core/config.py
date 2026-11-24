@@ -46,6 +46,25 @@ class Settings(BaseSettings):
     demo_request_ban_seconds: int = Field(default=3600, ge=60, le=604800)
     # Demandes enregistrées par heure, toutes adresses confondues.
     demo_request_global_limit: int = Field(default=30, ge=1, le=10000)
+    # Facturation (app/modules/billing). Sans clé Stripe, Checkout, le portail
+    # et le webhook répondent BILLING_NOT_CONFIGURED ; la page Facturation et
+    # les PDF des factures manuelles restent disponibles. La version d'API est
+    # figée : les objets Stripe sont relus avec elle, quel que soit le format
+    # des événements reçus.
+    stripe_secret_key: str | None = Field(default=None, repr=False)
+    stripe_webhook_secret: str | None = Field(default=None, repr=False)
+    stripe_api_version: str = "2025-03-31.basil"
+    # Écart toléré entre l'horodatage signé d'un webhook et l'heure du serveur.
+    stripe_webhook_tolerance_seconds: int = Field(default=300, ge=30, le=3600)
+    # Retour de Checkout et du portail : {dashboard_url}/billing.
+    dashboard_url: str = "http://localhost:5173"
+    # Mentions des factures manuelles (PDF généré par l'API).
+    billing_seller_name: str = "Evoranq"
+    billing_seller_address: str = ""
+    billing_seller_siren: str = ""
+    billing_seller_vat: str = ""
+    billing_seller_iban: str = ""
+    billing_seller_email: str = ""
     ai_provider: Literal["disabled", "openai"] = "disabled"
     openai_api_key: str | None = Field(default=None, repr=False)
     openai_model: str = "gpt-6-astra"
