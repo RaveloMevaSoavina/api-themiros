@@ -15,7 +15,11 @@ from app.core.errors import ApiError
 from app.main import app
 from app.modules.billing.invoice_pdf import Seller
 from app.modules.billing.router import get_billing_service, get_webhook_handler
-from app.modules.billing.service import BillingService, StripeWebhookHandler
+from app.modules.billing.service import (
+    BillingService,
+    StripeWebhookHandler,
+    format_address,
+)
 from app.modules.billing.stripe_gateway import encode, verify_webhook
 
 ADMIN = CurrentUser(
@@ -691,7 +695,7 @@ async def test_customer_details_come_back_from_the_portal() -> None:
         {
             "customer_id": "cus_1",
             "billing_email": "Compta@Client.org",
-            "billing_address": "1 rue de la Paix\n75002 Paris\nFR",
+            "billing_address": "1 rue de la Paix\n75002 Paris\nFrance",
             "vat_number": "FR12345678901",
         }
     ]
@@ -767,3 +771,39 @@ def test_contact_route_confirms_the_save(client) -> None:
     )
     assert response.status_code == 200
     assert response.json() == {"saved": True}
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        (
+            {
+                "line1": "Antananarivo 102",
+                "line2": None,
+                "postal_code": "102",
+                "city": "Ambohijanaka",
+                "state": None,
+                "country": "MG",
+            },
+            "Antananarivo 102\n102 Ambohijanaka\nMadagascar",
+        ),
+        (
+            {
+                "line1": " 10  rue Lafayette ",
+                "line2": "Bâtiment B",
+                "postal_code": "75009",
+                "city": "Paris",
+                "state": "Paris",
+                "country": "fr",
+            },
+            "10 rue Lafayette\nBâtiment B\n75009 Paris\nFrance",
+        ),
+        (
+            {"line1": "1 Main St", "city": "Austin", "state": "TX", "country": "US"},
+            "1 Main St\nAustin\nTX\nÉtats-Unis",
+        ),
+        (None, ""),
+    ],
+)
+def test_stripe_addresses_are_formatted_for_display(address, expected) -> None:
+    assert format_address(address) == expected

@@ -20,6 +20,7 @@ from app.modules.billing.invoice_pdf import Seller, render_invoice_pdf
 from app.modules.billing.repository import BillingRepository
 from app.modules.billing.schemas import BillingContactRequest
 from app.modules.billing.stripe_gateway import StripeGateway, verify_webhook
+from app.modules.ingestion.domain import country_name
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,34 @@ def _not_configured() -> ApiError:
         code="BILLING_NOT_CONFIGURED",
         detail="La souscription en ligne n'est pas configurée",
     )
+
+
+def format_address(address: dict[str, Any] | None) -> str:
+    """Adresse postale Stripe en lignes, à la française : rue, complément,
+    « code postal ville », région, puis le pays en toutes lettres
+    (« MG » → « Madagascar »). Lignes vides et doublons écartés."""
+    address = address or {}
+
+    def clean(key: str) -> str:
+        return " ".join(str(address.get(key) or "").split())
+
+    city = clean("city")
+    locality = " ".join(part for part in (clean("postal_code"), city) if part)
+    state = clean("state")
+    code = clean("country").upper()
+    country = (country_name(code) or code) if code else ""
+    lines = [
+        clean("line1"),
+        clean("line2"),
+        locality,
+        state if state.casefold() != city.casefold() else "",
+        country,
+    ]
+    unique: list[str] = []
+    for line in lines:
+        if line and line.casefold() not in {seen.casefold() for seen in unique}:
+            unique.append(line)
+    return "\n".join(unique)
 
 
 async def _customer_exists(stripe: StripeApi, customer_id: str) -> bool:
@@ -448,21 +477,7 @@ class StripeWebhookHandler:
 
     async def sync_customer(self, customer_id: str) -> None:
         customer = await self._stripe.customer(customer_id)
-        address = customer.get("address") or {}
-        city = " ".join(
-            part for part in (address.get("postal_code"), address.get("city")) if part
-        )
-        formatted = "\n".join(
-            part
-            for part in (
-                address.get("line1"),
-                address.get("line2"),
-                city,
-                address.get("state"),
-                address.get("country"),
-            )
-            if part
-        )
+        formatted = format_address(customer.get("address"))
         tax_ids = (customer.get("tax_ids") or {}).get("data") or []
         vat = next(
             (tax["value"] for tax in tax_ids if tax.get("type") == "eu_vat"),
