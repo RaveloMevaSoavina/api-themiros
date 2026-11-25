@@ -735,6 +735,7 @@ def test_webhook_route_accepts_a_signed_event(client) -> None:
                 "object": {
                     "mode": "subscription",
                     "subscription": "sub_1",
+                    "customer": "cus_1",
                     "client_reference_id": ORG,
                 }
             },
@@ -745,6 +746,9 @@ def test_webhook_route_accepts_a_signed_event(client) -> None:
     )
     assert response.status_code == 200
     assert repository.subscriptions[0]["stripe_subscription_id"] == "sub_1"
+    # Coordonnées saisies dans Checkout recopiées au passage.
+    assert repository.customers[0]["customer_id"] == "cus_1"
+    assert repository.customers[0]["vat_number"] == "FR12345678901"
 
 
 def test_checkout_route_returns_the_stripe_url(client) -> None:

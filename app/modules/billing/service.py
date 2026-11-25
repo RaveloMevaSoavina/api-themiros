@@ -307,6 +307,10 @@ class StripeWebhookHandler:
                 await self.sync_subscription(
                     _id(obj["subscription"]), hint=obj.get("client_reference_id")
                 )
+            # Adresse et n° de TVA saisis dans Checkout : recopiés sans
+            # attendre un customer.updated.
+            if obj.get("customer"):
+                await self.sync_customer(_id(obj["customer"]))
         elif event_type.startswith("customer.subscription."):
             await self.sync_subscription(obj["id"])
         elif event_type.startswith("invoice."):
