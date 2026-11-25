@@ -403,6 +403,18 @@ class StripeWebhookHandler:
         subscription_id = _id(parent.get("subscription")) or _id(
             invoice.get("subscription")
         )
+        # L'abonnement est relu à chaque facture : un événement
+        # customer.subscription.* perdu (ou non coché sur le point d'entrée)
+        # ne laisse pas l'offre vide. Son échec ne bloque pas la facture.
+        if subscription_id:
+            try:
+                await self.sync_subscription(subscription_id)
+            except Exception:
+                logger.exception(
+                    "Abonnement Stripe %s non resynchronisé (facture %s)",
+                    subscription_id,
+                    invoice_id,
+                )
         transitions = invoice.get("status_transitions") or {}
         total = _euros(invoice.get("total"))
         amount = _euros(

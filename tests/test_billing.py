@@ -610,6 +610,7 @@ async def test_a_failure_is_recorded_and_returns_500_for_a_retry() -> None:
 
 async def test_a_paid_invoice_is_mirrored_with_stripe_amounts() -> None:
     repository, stripe = FakeRepository(), FakeStripe()
+    stripe.remote_subscriptions["sub_1"] = stripe_subscription()
     stripe.remote_invoices["in_1"] = {
         "id": "in_1",
         "number": "THS-0001",
@@ -632,6 +633,10 @@ async def test_a_paid_invoice_is_mirrored_with_stripe_amounts() -> None:
 
     await handler(repository, stripe).handle(body, header)
 
+    # L'abonnement de la facture est resynchronisé au passage.
+    assert [row["stripe_subscription_id"] for row in repository.subscriptions] == [
+        "sub_1"
+    ]
     assert repository.invoices == [
         {
             "organization_id": ORG,
@@ -648,6 +653,28 @@ async def test_a_paid_invoice_is_mirrored_with_stripe_amounts() -> None:
             "paid_on": date(2026, 11, 24),
         }
     ]
+
+
+async def test_an_invoice_is_mirrored_even_if_its_subscription_fails() -> None:
+    repository, stripe = FakeRepository(), FakeStripe()
+    stripe.fail = True
+    stripe.remote_invoices["in_1"] = {
+        "id": "in_1",
+        "number": "THS-0002",
+        "status": "paid",
+        "customer": "cus_1",
+        "parent": {"subscription_details": {"subscription": "sub_1"}},
+        "total": 408000,
+        "total_excluding_tax": 408000,
+        "created": ts(date(2026, 11, 23)),
+        "status_transitions": {},
+        "lines": {"data": []},
+    }
+
+    await handler(repository, stripe).sync_invoice("in_1")
+
+    assert repository.subscriptions == []
+    assert [row["number"] for row in repository.invoices] == ["THS-0002"]
 
 
 async def test_a_draft_invoice_is_not_mirrored() -> None:
