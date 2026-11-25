@@ -108,6 +108,11 @@ class FakeRepository:
         self.customer = self.customer or customer_id
         return self.customer
 
+    async def replace_customer(self, organization_id, stale_id, customer_id):
+        if self.customer == stale_id:
+            self.customer = customer_id
+        return self.customer
+
     async def organization_for_customer(self, customer_id):
         return ORG if customer_id == "cus_1" else None
 
@@ -140,6 +145,8 @@ class FakeStripe:
         self.updated: list[tuple[str, dict]] = []
         self.remote_subscriptions: dict[str, dict] = {}
         self.remote_invoices: dict[str, dict] = {}
+        self.missing_customers: set[str] = set()
+        self.deleted_customers: set[str] = set()
         self.fail = False
 
     async def price(self, lookup_key):
@@ -169,6 +176,15 @@ class FakeStripe:
         return self.remote_invoices[invoice_id]
 
     async def customer(self, customer_id):
+        if customer_id in self.missing_customers:
+            raise ApiError(
+                status_code=502,
+                code="STRIPE_REQUEST_FAILED",
+                detail="x",
+                context={"upstream_status": 404, "upstream_code": "resource_missing"},
+            )
+        if customer_id in self.deleted_customers:
+            return {"id": customer_id, "deleted": True}
         return {
             "id": customer_id,
             "email": "Compta@Client.org",
@@ -310,6 +326,32 @@ async def test_checkout_creates_the_customer_once_and_builds_return_urls() -> No
     assert session["success_url"] == "https://app.themiros.com/billing?checkout=success"
     assert session["cancel_url"] == "https://app.themiros.com/billing?checkout=canceled"
     assert session["automatic_tax"] == {"enabled": True}
+
+
+@pytest.mark.parametrize("gone", ["missing_customers", "deleted_customers"])
+async def test_checkout_replaces_a_customer_gone_from_stripe(gone) -> None:
+    repository, stripe = FakeRepository(customer="cus_gone"), FakeStripe()
+    getattr(stripe, gone).add("cus_gone")
+
+    await service(repository, stripe).checkout("essential", ADMIN)
+
+    assert stripe.customers_created == [{"organization_id": ORG}]
+    assert repository.customer == "cus_new"
+    assert stripe.sessions[0]["customer"] == "cus_new"
+
+
+async def test_checkout_keeps_the_customer_on_other_stripe_errors() -> None:
+    repository, stripe = FakeRepository(customer="cus_1"), FakeStripe()
+
+    async def unavailable(customer_id):
+        raise ApiError(status_code=503, code="STRIPE_UNAVAILABLE", detail="x")
+
+    stripe.customer = unavailable
+    with pytest.raises(ApiError) as error:
+        await service(repository, stripe).checkout("essential", ADMIN)
+    assert error.value.code == "STRIPE_UNAVAILABLE"
+    assert stripe.customers_created == []
+    assert repository.customer == "cus_1"
 
 
 async def test_a_pilot_can_switch_to_self_serve() -> None:

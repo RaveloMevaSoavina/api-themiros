@@ -99,6 +99,22 @@ class BillingRepository:
             },
         )
 
+    async def replace_customer(
+        self, organization_id: str, stale_id: str, customer_id: str
+    ) -> str | None:
+        """Remplace un client Stripe disparu (supprimé, autre compte Stripe).
+        Seulement s'il est encore en place : un Checkout concurrent qui l'a
+        déjà remplacé garde le sien. Renvoie le client finalement en place."""
+        await self._gateway.service_update(
+            "organizations",
+            params={
+                "id": f"eq.{organization_id}",
+                "stripe_customer_id": f"eq.{stale_id}",
+            },
+            payload={"stripe_customer_id": customer_id},
+        )
+        return await self.stripe_customer_id(organization_id)
+
     async def organization_for_customer(self, customer_id: str) -> str | None:
         return await self._gateway.service_rpc(
             "stripe_organization_for_customer",

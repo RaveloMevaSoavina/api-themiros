@@ -77,6 +77,18 @@ def _not_configured() -> ApiError:
     )
 
 
+async def _customer_exists(stripe: StripeApi, customer_id: str) -> bool:
+    """Faux si Stripe ne connaît pas (ou plus) ce client ; toute autre erreur
+    remonte telle quelle."""
+    try:
+        customer = await stripe.customer(customer_id)
+    except ApiError as error:
+        if error.context.get("upstream_status") == 404:
+            return False
+        raise
+    return not customer.get("deleted")
+
+
 def _day(timestamp: int | None) -> date | None:
     if timestamp is None:
         return None
@@ -171,15 +183,29 @@ class BillingService:
         return session["url"]
 
     async def _customer(self, stripe: StripeApi, organization: dict[str, Any]) -> str:
+        """Client Stripe de l'organisation, créé à son premier Checkout. Un
+        client enregistré mais disparu chez Stripe (supprimé, ou clé d'un
+        autre compte) est recréé et remplacé, sans intervention manuelle."""
         organization_id = organization["id"]
         existing = await self._repository.stripe_customer_id(organization_id)
-        if existing:
+        if existing and await _customer_exists(stripe, existing):
             return existing
         created = await stripe.create_customer(
             organization_id=organization_id,
             name=organization["name"],
             email=organization.get("billing_email"),
         )
+        if existing:
+            logger.warning(
+                "Client Stripe %s introuvable pour l'organisation %s : remplacé par %s",
+                existing,
+                organization_id,
+                created["id"],
+            )
+            replaced = await self._repository.replace_customer(
+                organization_id, existing, created["id"]
+            )
+            return replaced or created["id"]
         # Deux admins en même temps : la base garde le premier client.
         return await self._repository.set_customer(organization_id, created["id"])
 

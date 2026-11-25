@@ -181,6 +181,10 @@ class StripeGateway:
     async def create_customer(
         self, *, organization_id: str, name: str, email: str | None
     ) -> dict[str, Any]:
+        # Pas de clé d'idempotence fixe par organisation : Stripe rejouerait
+        # pendant 24 h la réponse du premier appel, même pour un client
+        # supprimé depuis. Les doublons sont arbitrés par la base
+        # (stripe_set_customer garde le premier client enregistré).
         return await self._request(
             "POST",
             "customers",
@@ -189,7 +193,6 @@ class StripeGateway:
                 "email": email,
                 "metadata": {"organization_id": organization_id},
             },
-            idempotency_key=f"customer-{organization_id}",
         )
 
     async def update_customer(self, customer_id: str, **params: Any) -> None:
